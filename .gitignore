@@ -1,0 +1,23 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info
+
+# 本地环境
+.env
+.venv/
+venv/
+.trae
+
+# 调试运行产物
+debug/*
+
+# Web 前端
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+web/vite.config.js
+web/vite.config.d.ts
+
+# 编辑器与系统文件
+.DS_Store

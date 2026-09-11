@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turtlemap"
+version = "0.1.0"
+description = "A microkernel-style AgentOS project."
+requires-python = ">=3.10"
+dependencies = [
+    "aiomysql>=0.2.0",
+    "openai>=1.35.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.7.0",
+    "tiktoken>=0.7.0",
+    "json_repair>=0.59.4",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"turtlemap.os.store.mysql" = ["migrations/*.sql"]
