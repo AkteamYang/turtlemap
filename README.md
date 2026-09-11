@@ -16,7 +16,6 @@
 
 ![TurtleMap运行演示](docs/pic/Sep-11-2026%2013-31-20.gif)
 
-> TurtleMap目前处于技术验证阶段。核心Runtime能力和全栈示例均可运行，但尚未发布稳定API，接口仍可能调整。
 
 ## 项目定位
 
