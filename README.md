@@ -33,18 +33,18 @@ TurtleMap将Agent理解为一个持续接收输入、维护状态、执行动作
 
 ## 核心能力
 
-| 能力 | 说明 | 当前状态 |
-| --- | --- | --- |
-| Agent Loop | 组织输入接收、上下文构建、模型推理、工具执行和状态推进 | 已实现 |
-| 服务端状态管理 | 分层维护Session State、Agent State和Processing Task，前端无需持有运行现场 | 已实现 |
-| Checkpoint / Resume | 通过状态序列化与StateStore保存稳定执行现场，支持中断后恢复 | 已实现 |
-| 可恢复异步Request/Response | 将HITL和后台任务回流统一抽象为任务挂起、响应关联与断点恢复 | 已实现 |
-| Tool Execution | Tool Schema、参数校验、同步/异步调用、统一ToolResult和系统工具注入 | 已实现 |
-| Human-in-the-loop | 根据工具元数据自动插入审批步骤，审批结果通过中断响应回流 | 已实现 |
-| Context Engineering | Token Budget、同步/后台压缩、历史折叠与压缩结果一致性合并 | 已实现 |
-| Agent Memory | 长期/中期记忆管理、历史压缩和模型上下文注入 | 已实现 |
-| Event Bus / ResultCollector | 分发结构化Runtime事件，并从事件流聚合稳定运行结果 | 已实现 |
-| StateStore扩展 | 默认提供内存实现，并通过协议支持MySQL等外部持久化方案 | 已实现 |
+| 能力 | 说明 |
+| --- | --- |
+| Agent Loop | 组织输入接收、上下文构建、模型推理、工具执行和状态推进 |
+| 服务端状态管理 | 分层维护Session State、Agent State和Processing Task，前端无需持有运行现场 |
+| Checkpoint / Resume | 通过状态序列化与StateStore保存稳定执行现场，支持中断后恢复 |
+| 可恢复异步Request/Response | 将HITL和后台任务回流统一抽象为任务挂起、响应关联与断点恢复 |
+| Tool Execution | Tool Schema、参数校验、同步/异步调用、统一ToolResult和系统工具注入 |
+| Human-in-the-loop | 根据工具元数据自动插入审批步骤，审批结果通过中断响应回流 |
+| Context Engineering | Token Budget、同步/后台压缩、历史折叠与压缩结果一致性合并 |
+| Agent Memory | 长期/中期记忆管理、历史压缩和模型上下文注入 |
+| Event Bus / ResultCollector | 分发结构化Runtime事件，并从事件流聚合稳定运行结果 |
+| StateStore扩展 | 默认提供内存实现，并通过协议支持MySQL等外部持久化方案 |
 
 ## 总体架构
 
