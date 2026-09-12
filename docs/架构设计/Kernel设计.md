@@ -26,7 +26,7 @@
 
 `kernel` 的价值不在于功能多，而在于边界清晰、闭环稳定、可被上层长期复用。
 
-从实现策略上看，`kernel` 更适合负责三类内容：
+从实现策略上看，`kernel` 适合负责三类内容：
 
 - 架构定义
 - 核心数据结构
@@ -137,7 +137,7 @@
 
 ## 5. kernel 最小组成
 
-当前建议 `kernel` 最少围绕五部分设计：
+`kernel` 最少围绕五部分设计：
 
 - `Input`
 - `SessionState`
@@ -186,7 +186,7 @@
 
 这里的会话不是简单聊天窗口，而是“一件事”的运行现场。先有某件事，才会有处理这件事所需的 Agent；Agent 依托于会话而存在，但 Agent 本身可以跨会话被引用。
 
-当前建议先按以下结构收敛：
+当前先按以下结构收敛：
 
 - `SessionState`：会话级状态根
   - `agent_name2agent_state`：`dict[agent_name, BaseAgentState]`，随 SessionState 保存的完整 AgentState 映射
@@ -258,7 +258,7 @@
 
 因此，子 Agent 如果只是作为当前 Agent 的外部能力被调用，应封装成 `tool`；如果需要接管后续多轮会话输入，则属于 `handoff`，由 `Runtime` / `os` 负责切换当前会话的对话主体，而不是放进当前 Agent 的 `BaseProcessingTask.state`。
 
-- 我们希望用一套结构化的 `ToolMetadata` 来规范化 `tool` 的使用，从而提高接入效果的下限，而不是把工具描述质量完全交给开发者个人的提示词能力。
+- 系统使用结构化 `ToolMetadata` 规范化 `tool` 的使用，提高接入效果的下限，而不是把工具描述质量完全交给开发者个人的提示词能力。
 - 工具接入方式可以同时支持 `tool` 装饰的普通函数和 `ExecutableTool` 对象。
 - `ToolMetadata`：
   - `Identity` 身份层：`name`、`version`、`id`、`namespace`
@@ -326,9 +326,9 @@
 
 #### 事件特征匹配逻辑
 
-接收到新的 `Input` 时应该如何匹配到对应的 `BaseProcessingTask`，我们根据不同情况展开讨论：
-- 如果 `processing_tasks` 为空，则新创建一个 `MessageState` 类型的 `BaseProcessingTask`，用于接收 LLM 的 assistant message 输出
-- 如果不为空，`processing_tasks` 的状态应该都是“等待结果”，因为我们前置进行了“中断恢复策略”。遍历 `Input.events`：对于 `tool_result`，优先匹配 `AutoResponseState` 并补齐对应异步 unit 的结果；对于 `HandoffState`，根据 `handoff_result` 恢复 `return_task_id` 对应任务；其他 `AutoResponseState` 类型的匹配规则可继续按 `trigger_event_type` 细化
+新的 `Input` 按以下规则匹配对应的 `BaseProcessingTask`：
+- 若 `processing_tasks` 为空，则创建一个 `MessageState` 类型的 `BaseProcessingTask`，用于接收 LLM 的 assistant message 输出。
+- 若不为空，`processing_tasks` 的状态均为“等待结果”，因为前置流程已执行中断恢复策略。遍历 `Input.events`：对于 `tool_result`，优先匹配 `AutoResponseState` 并补齐对应异步 unit 的结果；对于 `HandoffState`，根据 `handoff_result` 恢复 `return_task_id` 对应任务；其他 `AutoResponseState` 类型的匹配规则按 `trigger_event_type` 细化。
 
 ## 6. kernel 运行闭环
 
@@ -398,7 +398,7 @@ Input
 
 但在 `kernel` 阶段，`Knowledge` 不应被简单理解为动态检索结果集合。更准确地说，`BaseAgentState.Knowledge` 是当前 Agent 面向当前会话 / 当前任务的记忆上下文视图。
 
-当前建议是：
+当前定义如下：
 
 - 长期记忆和中期记忆都可以采用结构化纯文本载体
 - 中期记忆承接会话摘要、阶段总结和当前约束，支持 LLM 滚动重写

@@ -211,7 +211,7 @@ while has_recoverable_task(session) or queue not empty:
 
 ### 6.2 恢复优先级
 
-当前阶段建议：
+当前阶段：
 
 1. 若存在“已完成但尚未完成状态转移推进”的任务，先继续推进
 2. 若存在可继续执行的未完成任务，先继续该任务
@@ -261,7 +261,7 @@ while has_recoverable_task(session) or queue not empty:
 
 ### 6.5 HandoffState 恢复
 
-当前阶段不建议把 `HandoffState` 设计成需要单独恢复的复杂中间现场。
+当前阶段不应把 `HandoffState` 设计成需要单独恢复的复杂中间现场。
 
 原因是：
 
@@ -304,7 +304,7 @@ while has_recoverable_task(session) or queue not empty:
 
 ### 7.2 事件分派顺序
 
-当前阶段建议：
+当前阶段：
 
 1. 先按 `priority` 排序
 2. 再按输入中原始顺序稳定处理
@@ -324,7 +324,7 @@ while has_recoverable_task(session) or queue not empty:
 
 当前 Owner Agent 若不存在可继续推进的 `running` 任务，则 `BaseRuntime` 才进入新输入接管流程。
 
-当前阶段建议按下面顺序处理：
+当前阶段按下面顺序处理：
 
 1. 从 `SessionState.input_queue` 中取出一个 `Input`
 2. 读取 `Input.events[0]`
@@ -360,7 +360,7 @@ user_input
 
 ### 8.2 MessageState 执行
 
-当 `BaseRuntime` 因 `user_input` 创建新的 `MessageState` 后，执行顺序建议为：
+当 `BaseRuntime` 因 `user_input` 创建新的 `MessageState` 后，执行顺序应为：
 
 1. 创建新的 `BaseProcessingTask`
 2. 将 `state` 初始化为 `MessageState(status = running)`
@@ -415,14 +415,14 @@ user_input
 - 工具执行中需要用户补充结构化参数
 - 工具执行中需要用户对上一步结果做明确选择
 
-这类 unit 的处理边界建议如下：
+这类 unit 的处理边界如下：
 
 1. unit 首次执行时构造 `InterruptionRequest`，并将任务切换为 `paused`
 2. 原 unit 保持 `pending`，不创建额外的 unit 级等待状态
 3. response 通过 `request_id` 匹配 request，挂载 response 后将任务恢复为 `running`
 4. unit 再次执行时读取 request 中的 response，并在 os 层解释更细的业务判定
 
-当前阶段建议至少支持以下业务结果：
+当前阶段至少支持以下业务结果：
 
 - `confirmed`
 - `rejected`
@@ -446,7 +446,7 @@ user_input
 
 ### 8.4.2 `switch_topic` 的 BaseRuntime 动作
 
-当确认类 unit 返回的话题切换结果要求 `BaseRuntime` 接管时，建议执行以下动作：
+当确认类 unit 返回的话题切换结果要求 `BaseRuntime` 接管时，应执行以下动作：
 
 1. 当前 `BaseProcessingTask` 从 `running` 切到 `paused`
 2. 写入一条“当前任务已暂停，等待后续恢复”的占位消息到 `History`
@@ -463,7 +463,7 @@ user_input
 
 `background` 工具不再采用“原 `ToolState` 保持未完成并等待外部补写结果”的设计。
 
-当前阶段建议改为：
+当前阶段改为：
 
 1. `background` 类型的 tool unit 在当前轮执行时直接返回占位描述
 2. 该 unit 当轮即闭合为 `completed`
@@ -531,7 +531,7 @@ assistant 决定 handoff
 
 ### 9.3 回写时机
 
-建议规则：
+规则：
 
 - 普通 assistant 回复完成时立即写入
 - tool loop 完整闭合后写入最终用户可见结果
@@ -552,7 +552,7 @@ assistant 决定 handoff
 
 ### 9.4.2 当前轮执行规则
 
-当某个 tool unit 的 `execution_strategy = async` 时，建议按以下规则执行：
+当某个 tool unit 的 `execution_strategy = async` 时，按以下规则执行：
 
 1. 当前 unit 执行时只生成占位描述，不等待稳定工具结果
 2. 当前 unit 直接闭合为 `completed`
@@ -566,7 +566,7 @@ assistant 决定 handoff
 
 ### 9.4.3 ToolState complete 推进规则
 
-当原 `ToolState` 进入 complete 推进阶段时，若检测到存在 `background` unit，建议执行以下动作：
+当原 `ToolState` 进入 complete 推进阶段时，若检测到存在 `background` unit，应执行以下动作：
 
 1. 正常整理当前 `ToolState` 的稳定消息并写入 `History`
 2. 额外补一条固定任务说明消息，明确告知“任务已转为异步执行，结果返回后会通知用户”
@@ -576,11 +576,11 @@ assistant 决定 handoff
 6. `payload` 装载当前异步闭环所需的最小恢复材料
 7. 由 `ToolService` 负责识别哪些 unit 属于异步 unit，并启动对应后台任务
 
-其中 `payload` 建议使用带 `type` 判别字段的 `TypedDict union` 结构，而不是裸字典。
+其中 `payload` 使用带 `type` 判别字段的 `TypedDict union` 结构，而不是裸字典。
 
-### 9.4.4 AutoResponseState 建议负载
+### 9.4.4 AutoResponseState 负载
 
-对于 `trigger_event_type = tool_result` 的 `AutoResponseState`，`payload` 建议至少承接：
+对于 `trigger_event_type = tool_result` 的 `AutoResponseState`，`payload` 至少承接：
 
 - `source_task_id`
 - `source_agent_name`
@@ -597,7 +597,7 @@ assistant 决定 handoff
 
 后台任务完成后，应统一以新的 `Input` 重新进入 `BaseRuntime`。
 
-当前阶段建议：
+当前阶段：
 
 - `ObservableEvent.event_type = tool_result`
 - `ObservableEvent.payload` 使用 `TypedDict union`
@@ -616,7 +616,7 @@ assistant 决定 handoff
 
 ### 9.4.6 AutoResponseState complete 推进规则
 
-当 `AutoResponseState` 进入 complete 推进阶段，且 `trigger_event_type = tool_result` 时，建议：
+当 `AutoResponseState` 进入 complete 推进阶段，且 `trigger_event_type = tool_result` 时，：
 
 1. 从 `payload` 中取出原始 `tool_state`
 2. 取出原始问题与全部异步 `tool_result`
@@ -669,7 +669,7 @@ assistant 决定 handoff
 
 ### 11.2 checkpoint 分类
 
-当前阶段建议按通用状态节点划分 checkpoint，而不是按业务路径逐一设计。
+当前阶段按通用状态节点划分 checkpoint，而不是按业务路径逐一设计。
 
 - “任务创建完成 checkpoint” 表示 `BaseProcessingTask` 已创建完成并进入可调度状态，恢复后 `BaseRuntime` 已经知道当前任务现场从哪里继续
 - “任务执行完成 checkpoint” 表示任务核心执行已经结束，但后续状态转移推进尚未完成
@@ -688,7 +688,7 @@ assistant 决定 handoff
 - 任务执行与状态转移推进应分开；两者之间以及推进完成后都允许形成稳定 checkpoint
 - 恢复流程应围绕“当前 checkpoint 属于哪一类”继续推进，而不是围绕具体业务名称分叉
 
-### 11.3 当前阶段建议的可恢复节点
+### 11.3 当前阶段可恢复节点
 
 当前阶段不必逐条枚举所有业务路径的可恢复节点。
 
@@ -733,7 +733,7 @@ assistant 决定 handoff
 
 ### 13.2 核心思路
 
-当前建议：
+当前：
 
 1. 业务层加载或创建 `SessionState`
 2. os Runtime 初始化时补齐 `agent_name2agent_state`
@@ -746,9 +746,9 @@ assistant 决定 handoff
 - `BaseAgentState` 不再单独保存为可被引用的版本
 - `input_queue` 的追加也通过保存新的 `SessionState` 实现；只是这种保存语义上属于输入持久化，不等同于新的 `BaseRuntime` checkpoint
 
-### 13.3 版本字段建议
+### 13.3 版本字段
 
-当前建议由业务层 SessionState 子类或 persistence model 承接版本化存储。
+当前由业务层 SessionState 子类或 persistence model 承接版本化存储。
 
 其中：
 
@@ -765,7 +765,7 @@ assistant 决定 handoff
 
 ### 13.4 提交顺序
 
-建议一次 `BaseRuntime` 提交按下面顺序执行：
+一次 `BaseRuntime` 提交按下面顺序执行：
 
 1. kernel 更新当前内存态 `SessionState`
 2. os Runtime 调用 `OSService.save_session_state(...)`
@@ -781,7 +781,7 @@ assistant 决定 handoff
 
 ### 13.5 恢复规则
 
-恢复时建议：
+恢复时：
 
 1. 业务层读取或创建某个 `session_id` 对应的 `SessionState`
 2. 将 `SessionState` 传入 os `Runtime.run(...)`
@@ -800,7 +800,7 @@ assistant 决定 handoff
 
 恢复时除了恢复 `kernel` 自身状态，业务层也可以校准 `os` 层已生成的派生记录。
 
-建议规则：
+规则：
 
 1. 若业务层 SessionState 带有 `version`，派生记录可以绑定 `session_id + version`
 2. 若没有版本字段，派生记录应只作为展示、审计或观测数据，不反向参与 kernel 恢复
@@ -818,9 +818,9 @@ assistant 决定 handoff
 - 老会话的最新稳定版本必须保留
 - 短时间内高频写入会话，仅按时间也无法有效控制体积
 
-### 14.2 推荐保留策略
+### 14.2 保留策略
 
-当前建议每个 `session_id`：
+当前每个 `session_id`：
 
 1. 至少保留最新可恢复的 `SessionState`
 2. 若业务层使用版本化快照，可额外保留最近 `2` 到 `5` 个已提交稳定版本
@@ -835,13 +835,13 @@ assistant 决定 handoff
 
 ### 14.4 可选时间兜底
 
-如果后续需要时间策略，建议只作为兜底规则，而不是主规则。
+如果后续需要时间策略，只作为兜底规则，而不是主规则。
 
 例如：
 
 - 清理 `7` 天前且不在最近版本保留窗口内的历史会话快照
 
-当前阶段不建议使用：
+当前阶段不应使用：
 
 - “清理 10 分钟前版本”
 - “清理 1 小时前版本”
@@ -871,9 +871,9 @@ assistant 决定 handoff
 - tracing / 审计 / 展示通道
 - 自动响应复杂触发规则
 
-## 16. 第一阶段实现建议
+## 16. 第一阶段实现
 
-第一阶段建议只实现四条最小主路径：
+第一阶段只实现四条最小主路径：
 
 1. `user_input -> MessageState -> History`
 2. `assistant tool_calls -> ToolState -> tool_result -> continuation`
@@ -887,7 +887,7 @@ assistant 决定 handoff
 - tool 执行器策略
 - 复杂压缩回写
 
-此外建议首批就把以下基础设施一起做掉：
+此外首批就把以下基础设施一起做掉：
 
 - `SessionState` / `BaseAgentState` 的版本化快照存储
 - `SessionState` 作为唯一生效锚点的提交协议

@@ -53,7 +53,7 @@
 
 ## 4. 最小模型
 
-当前最小建议只包含两类核心记录：
+当前最小只包含两类核心记录：
 
 - `context_material`
 - `llm_call`
@@ -67,7 +67,7 @@
 
 `context_material` 表表示可被 LLM 输入引用的上下文材料实体。
 
-建议至少包含以下字段：
+至少包含以下字段：
 
 - `id`：材料主键
 - `material_type`：材料类型，例如 `system`、`task_input`、`history`、`memory`、`tool_result`、`tool_schema`
@@ -88,7 +88,7 @@
 
 `llm_call` 表表示一次真实发生的 LLM 调用。
 
-建议至少包含以下字段：
+至少包含以下字段：
 
 - `id`：调用主键
 - `session_id`：所属会话
@@ -105,7 +105,7 @@
 - `input_material_ids`：本次 LLM 调用实际输入材料 id 的有序列表
 - `output_material_ids`：本次 LLM 调用产生的输出材料 id 的有序列表
 
-第一阶段可以直接把 id 序列保存在 `llm_call` 表中。推荐使用 JSON array；若工程上希望进一步简化，也可以使用逗号分隔字符串，但读取时通常仍由程序解析后再批量查询材料表。
+第一阶段可以直接把 id 序列保存在 `llm_call` 表中。采用使用 JSON array；若工程上希望进一步简化，也可以使用逗号分隔字符串，但读取时通常仍由程序解析后再批量查询材料表。
 
 后续如果需要按材料反查所有 LLM 调用、统计材料复用频率，或给每条引用关系挂更多字段，再升级为 `llm_call_material` 关联表。
 
@@ -154,9 +154,9 @@ where id in (...);
 
 动态材料通过 `context_material.material_type` 和 `metadata` 区分，例如 `task_input`、`tool_result`、`memory`、`runtime_patch`。第一阶段不单独建立引用关系表，因此这类筛选默认在程序侧读取材料后完成。
 
-## 6. 与当前 Runtime 的衔接建议
+## 6. 与当前 Runtime 的衔接
 
-当前最小方案建议把 observation 的记录点放在“上下文已经构建完成、模型调用即将发出”这一刻。
+当前最小方案把 observation 的记录点放在“上下文已经构建完成、模型调用即将发出”这一刻。
 
 也就是说，可以把记录过程理解为：
 
@@ -172,7 +172,7 @@ where id in (...);
 - 记录的是 LLM 实际看到的最终输入，而不是中间草稿
 - 不要求 `Runtime` 额外保存一份完整 prompt 副本
 
-当前阶段不建议把 observation 逻辑混进 `kernel` 核心状态对象中，而应作为独立记录通道挂在模型调用前后。
+当前阶段不应把 observation 逻辑混进 `kernel` 核心状态对象中，而应作为独立记录通道挂在模型调用前后。
 
 ## 7. 当前阶段刻意不解决的问题
 

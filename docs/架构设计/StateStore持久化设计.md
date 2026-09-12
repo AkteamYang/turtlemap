@@ -119,16 +119,16 @@ Agent 图补齐缺失的 AgentState，并将 AgentState.system 更新为当前�
 - `kernel.SessionState` 只负责表达 runtime 闭环所需的最小会话客观现场；
 - 一些明显偏业务层、回放层或产品层的会话扩展参数，不应直接回灌到
   `kernel.SessionState` 基础模型；
-- 这类信息更适合由 `os/store` 维护“会话业务派生模型”或“会话扩展记录”。
+- 这类信息适合由 `os/store` 维护“会话业务派生模型”或“会话扩展记录”。
 
-例如在 history version manager 场景中，以下字段都更适合放在 `os` 层扩展里：
+例如在 history version manager 场景中，以下字段都适合放在 `os` 层扩展里：
 
 - `branch_id`
 - 当前选中的历史回放版本
 - 当前默认 section 切分策略
 - 历史回放入口点、重开来源或产品侧标签
 
-也就是说，后续如果业务上需要“带 branch 语义的 session state”，更推荐：
+也就是说，后续如果业务上需要“带 branch 语义的 session state”，采用：
 
 ```text
 kernel.SessionState
@@ -223,7 +223,7 @@ StateStore saves full SessionState snapshot
 
 `session_state` 表保存业务层 MySQL 示例的会话级快照。
 
-建议字段：
+字段定义：
 
 | 字段 | 说明 |
 | --- | --- |
@@ -235,7 +235,7 @@ StateStore saves full SessionState snapshot
 | `save_kind` | 保存语义，例如 checkpoint / background_context_compression |
 | `created_at` | 创建时间 |
 
-建议索引：
+索引定义：
 
 ```text
 primary key(id)
@@ -257,9 +257,9 @@ AgentState，可以在自己的 persistence model 中扩展，但不属于 SDK �
 
 ### 7.5 agent_long_term_memory 表
 
-长期记忆作为跨会话主数据，建议单独保存。
+长期记忆作为跨会话主数据，应单独保存。
 
-建议字段：
+字段定义：
 
 | 字段 | 说明 |
 | --- | --- |
@@ -276,7 +276,7 @@ AgentState，可以在自己的 persistence model 中扩展，但不属于 SDK �
 
 ### 7.6 context_compression_task 表
 
-后台压缩任务不应挂在 `SessionState` JSON 中，MySQL 版本建议单独建表。
+后台压缩任务不应挂在 `SessionState` JSON 中，MySQL 版本应单独建表。
 
 原因是：
 
@@ -285,7 +285,7 @@ AgentState，可以在自己的 persistence model 中扩展，但不属于 SDK �
 - 任务状态更新频率和 SessionState checkpoint 不完全一致
 - 单独建表更容易做租约过期、失败标记和观测
 
-建议字段：
+字段定义：
 
 | 字段 | 说明 |
 | --- | --- |
@@ -338,7 +338,7 @@ MySQL unique 允许多条 `NULL`，所以 `completed` / `failed` 历史记录不
 - 枚举是否统一存储为字符串
 - 观测事实表、会话展示历史与 Runtime 状态快照之间的边界
 
-当前建议先采用“完整快照 JSON + 多态 type_name 恢复”的方式推进 MySQL 示例版本。
+当前先采用“完整快照 JSON + 多态 type_name 恢复”的方式推进 MySQL 示例版本。
 
 等运行闭环稳定后，再根据查询、观测和数据分析需求拆细表。
 
@@ -396,7 +396,7 @@ MySQL 版本可以有两种实现：
 1. 继续把 input_queue 放在 SessionState JSON 中，每次入队保存一个新的 SessionState 版本。
 2. 单独建立 input_queue 表，将输入事件作为 append-only 记录保存。
 
-第一阶段建议继续使用 SessionState JSON，保持实现简单。
+第一阶段继续使用 SessionState JSON，保持实现简单。
 
 如果后续输入并发、重放和观测要求提升，再考虑拆表。
 

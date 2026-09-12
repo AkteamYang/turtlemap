@@ -49,7 +49,7 @@ Branch View + Section Snapshot + Shared Message Storage
   `os/store` 先基于 `branch -> section -> message` 重建目标历史；
 - 随后再把本次真正需要进入运行态的消息列表装配回 `BaseAgentState.history`。
 
-如果业务层需要在会话维度持有诸如 `branch_id` 之类的扩展参数，也更适合由
+如果业务层需要在会话维度持有诸如 `branch_id` 之类的扩展参数，也适合由
 `os/store` 维护一份 session 业务扩展记录，或维护 `SessionState` 的派生持久化模型，
 而不是直接把这些字段并入 `kernel.SessionState`。
 
@@ -95,7 +95,7 @@ Conversation
 - 分支切换或历史分叉不复制 message；
 - `section_id` 仅表示该消息所属的逻辑区块，不表示唯一分支归属。
 
-建议结构如下：
+结构如下：
 
 ```sql
 CREATE TABLE message (
@@ -128,7 +128,7 @@ CREATE TABLE message (
 
 `section` 表用于表达某个 `branch_id` 下可见的历史区块快照。
 
-建议结构如下：
+结构如下：
 
 ```sql
 CREATE TABLE section (
@@ -420,7 +420,7 @@ message_250
 - `section_id`
 - `message_id`
 
-建议索引：
+索引定义：
 
 ```sql
 CREATE INDEX idx_message_conversation_section_message
@@ -436,7 +436,7 @@ ON message(conversation_id, section_id, message_id);
 - `conversation_id`
 - `branch_id`
 
-建议索引：
+索引定义：
 
 ```sql
 CREATE INDEX idx_section_conversation_branch
@@ -447,7 +447,7 @@ ON section(conversation_id, branch_id);
 
 分叉必须在同一事务中完成，避免出现半完成状态。
 
-建议流程：
+流程：
 
 ```text
 BEGIN TRANSACTION
@@ -515,7 +515,7 @@ section
 message
 ```
 
-这更容易落地到关系型数据库，并且更适合后续 `StateStore` 封装。
+这更容易落地到关系型数据库，并且适合后续 `StateStore` 封装。
 
 ## 13. 后续扩展方向
 
@@ -582,10 +582,10 @@ summary
   session 扩展记录，而不是直接侵入 kernel 基础模型；
 - 这层能力主要服务“业务侧历史回放、回退分叉、旧版本重开”等需求。
 
-因此它更适合作为当前最小可运行实现之上的增强层，而不是要求立即替换
+因此它适合作为当前最小可运行实现之上的增强层，而不是要求立即替换
 `BaseAgentState.history` 或否定 kernel 现有快照语义。
 
-如果未来要从当前原型平滑迁移到 section 方案，建议优先解决以下问题：
+如果未来要从当前原型平滑迁移到 section 方案，优先解决以下问题：
 
 1. 明确 `conversation_id`、`branch_id`、`section_id` 与当前 `session_id`、
    `agent_name`、`message_id` 的映射关系；

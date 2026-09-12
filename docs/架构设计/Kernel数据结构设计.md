@@ -81,7 +81,7 @@
 - `agent:238ab4c8-...`
 - `task:238ab4c8-...`
 
-当前阶段建议至少统一以下 id 字段：
+当前阶段至少统一以下 id 字段：
 
 - `session_id`
 - `task_id`
@@ -97,7 +97,7 @@
 
 ## 3. 核心对象总览
 
-第一阶段建议围绕以下核心对象建模：
+第一阶段围绕以下核心对象建模：
 
 ```text
 Input
@@ -163,7 +163,7 @@ ContextEngineering(os)
 
 所有 `kernel` 枚举在 Python 实现中都应继承 `str` 和 `Enum`。
 
-建议统一写法如下：
+统一写法如下：
 
 ```python
 from enum import Enum
@@ -456,7 +456,7 @@ class EventType(str, Enum):
 
 `MemoryView` 是当前 Agent 面向当前会话和任务的分层记忆上下文视图。
 
-当前阶段，`MemoryView` 更适合被理解为 Agent 的稳定记忆视图，而不是纯动态检索结果视图。
+当前阶段，`MemoryView` 适合被理解为 Agent 的稳定记忆视图，而不是纯动态检索结果视图。
 
 其中：
 
@@ -672,7 +672,7 @@ kernel 只依赖产物类型进行流程控制，不解析 `payload` 的内部�
 | --- | --- | --- | --- | --- |
 | `trigger_event_type` | `EventType | None` | 否 | 是 | 期待触发的事件类型。 |
 | `trigger_source_id` | `str | None` | 否 | 是 | 期待触发的来源对象 id。 |
-| `payload` | `dict[str, Any] | None` | 否 | 是 | 自动响应任务运行所需的结构化负载，建议使用带 `type` 判别字段的 `TypedDict union`。 |
+| `payload` | `dict[str, Any] | None` | 否 | 是 | 自动响应任务运行所需的结构化负载，使用带 `type` 判别字段的 `TypedDict union`。 |
 | `objective` | `str` | 是 | 是 | 自动响应目标。 |
 
 约束：
@@ -878,7 +878,7 @@ kernel 只依赖产物类型进行流程控制，不解析 `payload` 的内部�
 
 ### 11.1 应持久化
 
-第一阶段建议持久化以下内容：
+第一阶段持久化以下内容：
 
 - `SessionState.session_id`
 - `SessionState.agent_frames`
@@ -897,7 +897,7 @@ kernel 只依赖产物类型进行流程控制，不解析 `payload` 的内部�
 
 ### 11.2 不应直接持久化到 SessionState
 
-第一阶段不建议直接持久化到 `SessionState` 的内容：
+第一阶段不应直接持久化到 `SessionState` 的内容：
 
 - `SessionState.agent_name2agent_state`
 - `MemoryView`
@@ -914,7 +914,7 @@ kernel 只依赖产物类型进行流程控制，不解析 `payload` 的内部�
 
 这些内容应由运行时补全，或由 `os` 层独立存储通道承接。
 
-## 12. 第一阶段实现建议
+## 12. 第一阶段实现
 
 第一阶段可以先按下面顺序落代码模型：
 
@@ -926,7 +926,7 @@ kernel 只依赖产物类型进行流程控制，不解析 `payload` 的内部�
 6. 工具模型：`ToolService`、`ExecutableTool`、`ToolMetadata`、`ToolResult`、`ExecutionUnit`
 7. os 上下文模型：`ContextBuildInput`、`ContextBuildResult`
 
-实现时建议遵守：
+实现时遵守：
 
 - 先使用明确枚举，不在运行逻辑中散落裸字符串
 - 所有枚举类统一继承 `str, Enum`，保证可比较、可序列化和可持久化

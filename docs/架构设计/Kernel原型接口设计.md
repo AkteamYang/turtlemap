@@ -42,7 +42,7 @@
 
 ### 3.2 Agent 最小字段
 
-建议 `Agent` 至少具备以下属性：
+`Agent` 至少具备以下属性：
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -61,7 +61,7 @@
 
 ### 3.3 ModelClient 注入边界
 
-第一阶段建议：
+第一阶段：
 
 - `Agent` 不持有 `ModelClient`
 - `Runtime` 通过 `OSService` 间接触达模型调用能力
@@ -69,7 +69,7 @@
 
 这样可以避免把运行时依赖混入 `Agent` 定义本身。
 
-补充实现建议：
+补充实现：
 
 - `kernel.BaseAgent` 只保留最小结构与 `build_tool_provider(...)` 这个扩展点
 - `os` 层提供 `Agent(BaseAgent)` 作为默认业务接入入口
@@ -82,7 +82,7 @@
 
 当前模型调用能力由 os 层 `OSService` 持有，并通过 `ModelClientProtocol` 暴露给上下文压缩、assistant 生成等 os 事务。
 
-当前阶段不需要复杂路由逻辑，建议只提供最小推理接口：
+当前阶段不需要复杂路由逻辑，只提供最小推理接口：
 
 | 方法 | 输入 | 输出 | 说明 |
 | --- | --- | --- | --- |
@@ -99,7 +99,7 @@
 
 `Runtime` 要跑通 `MessageState` 和 `ToolState` continuation，必须依赖统一模型调用接口。
 
-当前阶段不建议在 `kernel` 设计文档中重新展开一套独立的 LLM 配置与客户端细节。
+当前阶段不应在 `kernel` 设计文档中重新展开一套独立的 LLM 配置与客户端细节。
 
 补充说明：
 
@@ -136,14 +136,14 @@ kernel 不直接解析 `LLMMessage` 的具体字段，只根据 `RuntimeArtifact
 
 ### 4.4 ToolCallResponse
 
-参考 `agent_llm.py` 中 `invoke_with_tools(...)` 的职责，第一阶段建议显式支持“带工具 schema 的模型调用”。
+参考 `agent_llm.py` 中 `invoke_with_tools(...)` 的职责，第一阶段应显式支持“带工具 schema 的模型调用”。
 
 对 `Runtime` 来说，不需要单独暴露另一套复杂接口，但至少要保证：
 
 - `generate(...)` 可以接收 `tool_schemas`
 - 返回结果能够明确区分“普通 assistant 回复”和“assistant 决定调用工具”
 
-如果实现上希望单独建模，建议增加：
+如果实现上希望单独建模，增加：
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -186,7 +186,7 @@ kernel 不直接解析 `LLMMessage` 的具体字段，只根据 `RuntimeArtifact
 
 为了统一承接 `background` 工具结果回流，除了 `ExecutableTool` 外，还需要一个最小后台执行器接口。
 
-建议至少定义：
+至少定义：
 
 | 方法 | 说明 |
 | --- | --- |
@@ -203,7 +203,7 @@ kernel 不直接解析 `LLMMessage` 的具体字段，只根据 `RuntimeArtifact
 
 ### 7.1 输入 schema
 
-第一阶段建议 `complete_handoff` 至少接收：
+第一阶段中，`complete_handoff` 至少接收：
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -212,7 +212,7 @@ kernel 不直接解析 `LLMMessage` 的具体字段，只根据 `RuntimeArtifact
 
 ### 7.2 输出结果
 
-建议统一返回：
+统一返回：
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -226,9 +226,9 @@ kernel 不直接解析 `LLMMessage` 的具体字段，只根据 `RuntimeArtifact
 
 ## 8. 工具执行生命周期与前置校验接口
 
-### 8.1 建议签名
+### 8.1 接口签名
 
-第一阶段建议：
+第一阶段：
 
 ```python
 before_execute(
@@ -260,9 +260,9 @@ after_execute(
 
 ### 9.1 RuntimeDependencies
 
-为了让 `kernel` 在启动阶段统一接收依赖，第一阶段更推荐提供一个 `RuntimeDependencies` 聚合对象，而不是单独设计全局 provider 注册中心。
+为了让 `kernel` 在启动阶段统一接收依赖，第一阶段使用一个 `RuntimeDependencies` 聚合对象，而不是单独设计全局 provider 注册中心。
 
-建议 `RuntimeDependencies` 至少承接：
+`RuntimeDependencies` 至少承接：
 
 - `model_client_provider`
 - `context_build_provider`
@@ -277,12 +277,12 @@ after_execute(
 
 - `kernel` 不负责自行发现 provider
 - 所有依赖都由外部在启动阶段显式组装
-- 第一阶段不建议引入全局注册中心或 service locator
+- 第一阶段不应引入全局注册中心或 service locator
 - `Runtime` 只消费已经组装好的 `RuntimeDependencies`
 
 ### 9.2 Runtime 注入方式
 
-第一阶段建议：
+第一阶段：
 
 ```python
 runtime = Runtime(
@@ -303,9 +303,9 @@ runtime = Runtime(
 
 ### 9.3 TMRuntime 外层封装
 
-为了封装 `os` 层复杂度，第一阶段更推荐在 `kernel.Runtime` 外层增加一层 `TMRuntime` 或等价包装对象，而不是默认通过继承大量重写 `Runtime`。
+为了封装 `os` 层复杂度，第一阶段采用在 `kernel.Runtime` 外层增加一层 `TMRuntime` 或等价包装对象，而不是默认通过继承大量重写 `Runtime`。
 
-建议边界：
+边界：
 
 - `kernel.Runtime` 保持最小、稳定、可复用
 - `os` 负责创建 `RuntimeDependencies`
@@ -314,7 +314,7 @@ runtime = Runtime(
 
 ### 9.4 Runtime 可选扩展边界
 
-如果后续确实需要让 `os` 影响 `Runtime` 行为，建议只开放少量稳定钩子，而不是允许子类重写整个主循环。
+如果后续确实需要让 `os` 影响 `Runtime` 行为，只开放少量稳定钩子，而不是允许子类重写整个主循环。
 
 当前阶段可以接受的扩展方式是：
 
@@ -322,7 +322,7 @@ runtime = Runtime(
 - 钩子式扩展次之
 - 大量继承和重写主循环最后再考虑
 
-如果要先把 `kernel` 原型跑起来，建议最少实现：
+如果要先把 `kernel` 原型跑起来，最少实现：
 
 1. `Agent`
 2. `OSService`
@@ -336,7 +336,7 @@ runtime = Runtime(
 
 9. `BackgroundToolExecutor`
 
-如果要让业务侧更顺手接入，`os` 层建议额外提供：
+如果要让业务侧更顺手接入，`os` 层额外提供：
 
 10. `Agent`
 11. `ToolService`
