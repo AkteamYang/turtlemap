@@ -16,7 +16,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
-from turtlemap.kernel.models.enums import EventType, InterruptionRequestType
+from turtlemap.kernel.models.enums import EventSource, EventType, InterruptionRequestType
 from turtlemap.kernel.models.models import InterruptionResponsePayload
 from turtlemap.os.context.models import ContextCompressionLevel
 
@@ -95,8 +95,14 @@ class ServerMessageEventType(str, Enum):
     # assistant 文本增量。
     MESSAGE_DELTA = "message_delta"
 
+    # assistant 已展示文本的局部覆盖快照。
+    MESSAGE_PARTIAL = "message_partial"
+
     # assistant 稳定最终文本。
     MESSAGE_FINAL = "message_final"
+
+    # Agent 控制权栈变更。
+    AGENT_FRAME_CHANGE = "agent_frame_change"
 
     # 模型稳定选择工具。
     TOOL_CALL = "tool_call"
@@ -129,6 +135,9 @@ class InputEventData(BaseModel):
     # 输入包首个 ObservableEvent 的业务类型。
     event_type: EventType
 
+    # 输入包首个 ObservableEvent 的来源。
+    source: EventSource
+
     # 用户输入文本。
     user_input: str
 
@@ -155,27 +164,49 @@ class ActivityIndicatorData(BaseModel):
 class MessageDeltaData(BaseModel):
     """表示 message_delta 业务事件载荷。"""
 
-    # assistant 文本增量。
-    delta_content: str
+    # 模型返回的原始正文增量。
+    content: str | None = None
 
-
-class MessageFinalData(BaseModel):
-    """表示 message_final 业务事件载荷。"""
-
-    # assistant 消息生成耗时，单位毫秒。
-    duration_ms: int = 0
-
-    # assistant 稳定最终文本。
-    content: str
-
-    # 模型返回的推理文本；模型不支持时为空。
+    # 模型返回的原始推理内容增量。
     reasoning_content: str | None = None
 
-    # 模型完成原因。
-    finish_reason: str | None = None
+    # 面向用户展示的正文增量；为空表示回退使用原始正文。
+    display_content: str | None = None
 
-    # 模型调用用量。
-    usage: JsonDict | None = None
+    # 面向用户展示的推理内容增量；为空表示回退使用原始推理内容。
+    display_reasoning_content: str | None = None
+
+    # 面向后续 LLM 上下文的正文增量；为空表示回退使用原始正文。
+    context_content: str | None = None
+
+    # 面向后续 LLM 上下文的推理内容增量；为空表示回退使用原始推理内容。
+    context_reasoning_content: str | None = None
+
+
+class MessagePartialData(BaseModel):
+    """表示 message_partial 业务事件载荷。
+
+    说明:
+        该载荷是同一 message event 当前已展示内容的完整替换快照，不按 delta 追加。
+    """
+
+    # 当前消息原始正文的完整替换快照。
+    content: str | None = None
+
+    # 当前消息原始推理内容的完整替换快照。
+    reasoning_content: str | None = None
+
+    # 当前消息面向用户展示的正文完整替换快照。
+    display_content: str | None = None
+
+    # 当前消息面向用户展示的推理内容完整替换快照。
+    display_reasoning_content: str | None = None
+
+    # 当前消息面向后续 LLM 上下文的正文完整替换快照。
+    context_content: str | None = None
+
+    # 当前消息面向后续 LLM 上下文的推理内容完整替换快照。
+    context_reasoning_content: str | None = None
 
 
 class ToolCallData(BaseModel):
@@ -194,20 +225,67 @@ class ToolCallData(BaseModel):
     parameters_text: str | None = None
 
 
+class MessageFinalData(BaseModel):
+    """表示 message_final 业务事件载荷。"""
+
+    # assistant 消息生成耗时，单位毫秒。
+    duration_ms: int = 0
+
+    # assistant 稳定最终原始正文。
+    content: str | None = None
+
+    # assistant 稳定最终原始推理文本；模型不支持时为空。
+    reasoning_content: str | None = None
+
+    # assistant 稳定最终面向用户展示的正文；为空时回退使用原始正文。
+    display_content: str | None = None
+
+    # assistant 稳定最终面向用户展示的推理内容；为空时回退使用原始推理内容。
+    display_reasoning_content: str | None = None
+
+    # assistant 稳定最终面向后续 LLM 上下文的正文；为空时回退使用原始正文。
+    context_content: str | None = None
+
+    # assistant 稳定最终面向后续 LLM 上下文的推理内容；为空时回退使用原始推理内容。
+    context_reasoning_content: str | None = None
+
+    # 模型完成原因。
+    finish_reason: str | None = None
+
+    # 当前 assistant 消息生成的稳定工具调用列表。
+    tool_calls: list[ToolCallData] = Field(default_factory=list)
+
+    # 模型调用用量。
+    usage: JsonDict | None = None
+
+
+class AgentFrameChangeEventData(BaseModel):
+    """表示 Agent 控制权栈变更业务事件载荷。"""
+
+    # 变更后的目标 Agent 名称。
+    target: str
+
+    # 发起本次变更的来源 Agent 名称。
+    source: str
+
+    # 控制权栈变更动作。
+    type: str
+
+    # 控制权栈变更的业务原因。
+    reason: str
+
+
 class ToolResultData(BaseModel):
     """表示 tool_result 业务事件载荷。"""
 
     # 工具执行耗时，单位毫秒。
     duration_ms: int = 0
 
-    # LLM 工具调用 id。
-    tool_call_id: str
-
     # 工具执行状态。
     status: str
 
-    # 工具返回给模型的文本内容。
-    content: str
+    # 关联的标准化工具调用信息。
+    tool_call_data: ToolCallData
 
     # 工具原始结果，SDK 技术展示项目直接返回给前端。
     raw_data: Any = None
@@ -270,18 +348,24 @@ class CompleteData(BaseModel):
     """表示 complete 业务事件载荷。
 
     约束:
-        complete 仅用于确认本次 agent 生成结束，除耗时字段外不携带额外字段。
+        complete 用于确认一个会话轮次生成结束；仅 `is_final_complete` 为真时，
+        才表示当前 run 不会再继续输出新的会话轮次。
     """
 
     # 本次 agent run 总耗时，单位毫秒。
     duration_ms: int = 0
+
+    # 当前 complete 是否为整个 run 的最终完成标记。
+    is_final_complete: bool = False
 
 
 ServerMessageEventData = (
     InputEventData
     | ActivityIndicatorData
     | MessageDeltaData
+    | MessagePartialData
     | MessageFinalData
+    | AgentFrameChangeEventData
     | ToolCallData
     | ToolResultStartData
     | ToolResultData
@@ -389,6 +473,9 @@ class ServerMessageEvent(BaseModel):
     # 当前任务 id。
     task_id: str | None = None
 
+    # 当前事件所属 Agent 名称；无唯一归属时为空。
+    agent_name: str | None = None
+
     # Runtime 逻辑事件链 id。
     event_id: str
 
@@ -398,8 +485,11 @@ class ServerMessageEvent(BaseModel):
     # 当前事件投影时间，毫秒时间戳。
     start_ts_ms: int
 
-    # 是否为 Runtime 恢复时补发的历史事件。
-    is_history_event: bool = False
+    # 是否为中断前的历史事件。
+    is_history_event_for_interruption: bool = False
+
+    # 是否为历史重放事件
+    is_replay_event: bool = False
 
     # 事件载荷。
     data: ServerMessageEventData = Field(default_factory=CompleteData)

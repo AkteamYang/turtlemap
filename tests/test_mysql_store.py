@@ -301,7 +301,7 @@ class _FakeStateStoreRepository:
         self.session_record = record
         return record.version + 1
 
-    async def load_agent_long_term_memory(
+    async def load_long_term_memory(
         self,
         uid: int,
     ) -> AgentLongTermMemoryRecord | None:
@@ -477,24 +477,24 @@ def test_mysql_state_store_saves_os_session_state() -> None:
             "root_agent": AgentState(
                 agent_name="root_agent",
                 system=SystemDefinition(role="assistant", objective="help user"),
-                history=[
-                    RuntimeArtifact(
-                        type=RuntimeArtifactType.INPUT,
-                        payload=Input(
-                            input_id="input_1",
-                            events=[
-                                ObservableEvent(
-                                    event_id="event_1",
-                                    event_type=EventType.USER_INPUT,
-                                    source=EventSource.USER,
-                                    payload=UserInputPayload(content="你好"),
-                                )
-                            ],
-                        ),
-                    ),
-                ],
             )
         },
+        history=[
+            RuntimeArtifact(
+                type=RuntimeArtifactType.INPUT,
+                payload=Input(
+                    input_id="input_1",
+                    events=[
+                        ObservableEvent(
+                            event_id="event_1",
+                            event_type=EventType.USER_INPUT,
+                            source=EventSource.USER,
+                            payload=UserInputPayload(content="你好"),
+                        )
+                    ],
+                ),
+            ),
+        ],
     )
 
     asyncio.run(
@@ -514,7 +514,8 @@ def test_mysql_state_store_saves_os_session_state() -> None:
     assert "version" not in state_data
     assert "schema_version" not in state_data
     assert "agent_name2agent_state" in state_data
-    assert "history" in state_data["agent_name2agent_state"]["root_agent"]
+    assert "history" in state_data
+    assert "history" not in state_data["agent_name2agent_state"]["root_agent"]
 
 
 def test_in_memory_state_store_rejects_stale_session_version() -> None:

@@ -14,14 +14,15 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from turtlemap.kernel.models.enums import RuntimeArtifactType
+from turtlemap.kernel.models.enums import AgentFrameChangeType, EventSource, RuntimeArtifactType
+from turtlemap.kernel.models.models import AgentFrame, BaseAgentFrameChange
 from turtlemap.shared.typing import ensure_instance
 
 from .agent import BaseAgent
 from .models import (
+    EventSource,
     EventType,
     ExecutionUnitStatus,
-    InterruptionRequestType,
     TaskStateKind,
     TaskStatus,
     TaskSwitchAction,
@@ -38,12 +39,20 @@ from .models import (
     BaseProcessingTask,
     RuntimeArtifact,
     ToolState,
+    UserInputPayload,
 )
 from .tool import (
     ExecutionUnit,
+    ExecutionUnitResult,
     ToolExecutionContext,
 )
-from turtlemap.shared.ids import PREFIX_INPUT_ID, PREFIX_TASK_ID, generate_prefixed_id
+from .tool.models import K_RAW_DATA_EVENT
+from turtlemap.shared.ids import (
+    PREFIX_INPUT_ID,
+    PREFIX_OBSERVABLE_EVENT_ID,
+    PREFIX_TASK_ID,
+    generate_prefixed_id,
+)
 from turtlemap.shared.logger import Logger
 
 
@@ -53,11 +62,13 @@ class BaseRuntime:
     def __init__(
         self,
         root_agent: BaseAgent,
+        session_state: BaseSessionState,
     ):
         """初始化 BaseRuntime。
 
         参数:
             root_agent: 业务侧显式提供的根 Agent。
+            session_state: 当前 Runtime 绑定的会话状态。
         """
 
         # 根 Agent，控制整个可达 Agent 图的入口。
@@ -69,26 +80,22 @@ class BaseRuntime:
         # 运行时内存队列，负责控制异步生产消费流程。
         self.runtime_input_queue: asyncio.Queue[Input] = asyncio.Queue()
 
-        # 当前运行中的会话状态快照。
-        self.session_state: BaseSessionState = BaseSessionState()
+        # 当前 Runtime 绑定的会话状态；一个 Runtime 实例不在运行中切换会话。
+        self.session_state = session_state
 
     async def run(
         self,
         input_events: list[ObservableEvent],
-        session_state: BaseSessionState,
         **kwargs
     ) -> Any:
         """执行一次最小 Runtime 主循环。
 
         参数:
             input_events: 本轮进入 Runtime 的标准化事件。
-            session_state: 已由 os 层加载、初始化并装配完成的会话状态。
 
         返回:
             当前最新的 SessionState。
         """
-        self.session_state = session_state
-
         # 先根据持久化队列恢复运行时内存队列，保证中断前遗留输入优先处理。
         await self._restore_runtime_input_queue()
 
@@ -122,7 +129,7 @@ class BaseRuntime:
             # 可执行的任务
             running_task = self._pick_available_running_task(owner_state)
             if running_task is not None:
-                await self._continue_running_task(
+                await self._advance_running_task(
                     owner_agent=owner_agent,
                     owner_state=owner_state,
                     task=running_task,
@@ -136,6 +143,16 @@ class BaseRuntime:
             await self._process_new_input(
                 owner_state=owner_state
             )
+
+    def resolve_owner_agent(self) -> BaseAgent:
+        """根据当前 `SessionState` 推导当前 Owner Agent。
+
+        返回:
+            当前位于控制权栈顶的 Agent 运行时对象。
+        """
+
+        owner_agent_name = self.session_state.agent_frames[-1].agent_name
+        return self.agent_name2agent[owner_agent_name]
 
     async def _process_new_input(self, owner_state: BaseAgentState) -> None:
         """按输入队列顺序处理一个新输入包。
@@ -263,16 +280,6 @@ class BaseRuntime:
 
         return None
 
-    def resolve_owner_agent(self) -> BaseAgent:
-        """根据当前 `SessionState` 推导当前 Owner Agent。
-
-        返回:
-            当前位于控制权栈顶的 Agent 运行时对象。
-        """
-
-        owner_agent_name = self.session_state.agent_frames[-1].agent_name
-        return self.agent_name2agent[owner_agent_name]
-
     async def _override_service_commit_runtime_checkpoint(self) -> None:
         """提交一次 Runtime checkpoint。
 
@@ -315,6 +322,30 @@ class BaseRuntime:
         """
         raise NotImplementedError("子类实现")
 
+    async def _override_service_task_did_complete(
+        self,
+        owner_agent: BaseAgent,
+        owner_state: BaseAgentState,
+        task: BaseProcessingTask,
+    ) -> None:
+        """在任务真正完成后由子类补充完成结果。
+
+        参数:
+            owner_agent: 当前完成任务的 Owner Agent。
+            owner_state: 当前 Owner Agent 对应状态。
+            task: 已完成且已写入 history、尚未移除的任务现场。
+
+        返回:
+            无返回值。
+
+        说明:
+            OS 层可在此根据最终 LLM 消息或工具结果写入
+            `task.agent_frame_change`。kernel 只消费该稳定状态并执行对应的
+            Agent 控制权栈变更，不理解具体运行参数或业务控制标记。
+        """
+
+        _ = (owner_agent, owner_state, task)
+
     async def _override_service_input_did_process(
         self,
         task: BaseProcessingTask,
@@ -341,6 +372,39 @@ class BaseRuntime:
 
     def _override_service_create_task_from_input(self, input: Input) -> BaseProcessingTask:
         raise NotImplementedError("子类实现")
+
+    async def _override_service_agent_frame_did_change(
+        self,
+        owner_agent: BaseAgent,
+        source_task: BaseProcessingTask,
+        frame_change: BaseAgentFrameChange,
+    ) -> None:
+        """通知子类当前任务已切换到 handoff 状态。
+
+        参数:
+            source_task: 发起 handoff 的源任务。
+            handoff_state: 包含目标 Agent 与 handoff 产物的状态。
+        """
+
+        raise NotImplementedError("子类实现")
+
+    def _overrideable_pop_task(self, owner_state: BaseAgentState, task: BaseProcessingTask):
+        """从当前 BaseAgentState 中移除指定任务。
+
+        参数:
+            owner_state: 当前 Owner Agent 对应状态。
+            task: 需要移除的任务。
+
+        说明:
+            当前实现按 `task_id` 过滤任务列表；输入归属由任务状态自行持有，
+            因此移除任务时不再清理会话级 current input。
+        """
+
+        owner_state.processing_tasks = [
+            processing_task
+            for processing_task in owner_state.processing_tasks
+            if processing_task.task_id != task.task_id
+        ]
 
     async def _restore_runtime_input_queue(self) -> None:
         """根据 `SessionState.input_queue` 重建运行时内存队列。
@@ -461,7 +525,7 @@ class BaseRuntime:
                 f"event_id={event.event_id}, "
                 f"event_type={event.event_type}"
             )
-        
+
         # 目前仅支持创建 message 任务
         task = self._override_service_create_task_from_input(input=input)
         return task
@@ -508,6 +572,25 @@ class BaseRuntime:
                 f"当前 BaseRuntime 暂不支持推进该已完成任务类型：{task.state.kind}"
             )
 
+        # MessageState 转为 ToolState 后会回到 running，只有仍保持 completed 的任务才进入收尾。
+        if task.state.status == TaskStatus.COMPLETED:
+
+            # OS 层在任务终态集中解释最终消息和工具结果，决定是否需要切换 Agent frame。
+            await self._override_service_task_did_complete(
+                owner_agent=owner_agent,
+                owner_state=owner_state,
+                task=task,
+            )
+            if task.agent_frame_change is not None:
+                await self._change_agent_frame(
+                    owner_agent=owner_agent,
+                    task=task,
+                    frame_change=task.agent_frame_change,
+                )
+
+            # 控制权切换通知仍归属于源任务，因此必须在移除任务前完成。
+            self._overrideable_pop_task(owner_state=owner_state, task=task)
+
         # 任务已运行，清理旧的中断请求
         self._clear_interruption_request(task)
 
@@ -525,7 +608,8 @@ class BaseRuntime:
         说明:
             MessageState 在首轮执行结束后，只先把最终结果稳定落入任务现场并保存
             “任务完成 checkpoint”。真正的后续推进，例如写入 History 或切换到
-            ToolState，统一在下一轮 loop 处理，和其他任务保持一致。
+            ToolState，统一在下一轮 loop 处理，和其他任务保持一致。是否进入任务收尾
+            由调用方根据推进后的 `task.state.status` 统一判断。
         """
         message_state = ensure_instance(task.state, MessageState)
         if not message_state.message:
@@ -542,12 +626,6 @@ class BaseRuntime:
                 task=task,
                 message=message_state.message,
             )
-
-            # os 层已完成有效 tool_calls 裁剪；kernel 只根据执行单元是否存在推进流程。
-            if not execution_units:
-                self.restart_message_task(message_state)
-                return
-
             task.state = ToolState(
                 tool_call_message=message_state.message,
                 execution_units=execution_units,
@@ -565,50 +643,39 @@ class BaseRuntime:
             owner_state=owner_state,
             task=task,
         )
-        self._pop_task(owner_state=owner_state, task_id=task.task_id)
 
-    def restart_message_task(self, message_state: MessageState):
-        message_state.status = TaskStatus.RUNNING
-        message_state.no_tool_call = True
-        message_state.message = None
-
-    async def _start_new_task(
-        self,
-        owner_state: BaseAgentState,
-        start_input: Input | None = None,
-    ) -> None:
-        """创建一个刚由新输入触发的任务，后续执行由 Runtime 驱动
-
-        参数:
-            owner_agent: 当前 Owner Agent。
-            owner_state: 当前 Owner Agent 对应状态。
-
-        说明:
-            当前阶段新输入只会先进入 MessageState。
-            也就是说，该方法负责的是“从输入创建任务并开始首轮执行”，
-            这里不会直接启动一个已经处于 ToolState、HandoffState 等中间现场的任务。
-        """
-        current_input = start_input or await self._pop_input()
-        task = self._create_task_from_input(owner_state, current_input)
-        owner_state.processing_tasks.append(task)
-
-        # 调用完成
-        await self._override_service_input_did_process(
-            task=task,
-            agent_name=owner_state.agent_name,
-            processed_input=current_input,
-        )
-        
-        # 任务创建完成进行状态保存
-        await self._override_service_commit_runtime_checkpoint()
-
-    async def _continue_running_task(
+    async def _advance_completed_tool_task(
         self,
         owner_agent: BaseAgent,
         owner_state: BaseAgentState,
         task: BaseProcessingTask,
     ) -> None:
-        """恢复执行一个已存在的 running 任务。
+        """推进已闭合 ToolState 的最终落历史动作。
+
+        参数:
+            owner_agent: 当前 Owner Agent。
+            owner_state: 当前 Owner Agent 对应状态。
+            task: 当前已闭合、待收尾的工具循环任务。
+
+        说明:
+            ToolState 在所有 execution unit 闭合时已经保存“任务完成 checkpoint”。
+            这里仅负责把稳定结果整理进 history，不再重复 checkpoint。任务完成后的
+            Agent 控制权处理与任务移除由上层统一执行。
+        """
+        # 由子类实现会话历史的生成和持久化
+        await self._override_service_save_task_history(
+            owner_agent=owner_agent,
+            owner_state=owner_state,
+            task=task,
+        )
+
+    async def _advance_running_task(
+        self,
+        owner_agent: BaseAgent,
+        owner_state: BaseAgentState,
+        task: BaseProcessingTask,
+    ) -> None:
+        """推进 running 任务。
 
         说明:
             当前阶段 running 恢复只面向 ToolState。
@@ -618,12 +685,12 @@ class BaseRuntime:
         """
         match task.state.kind:
             case TaskStateKind.MESSAGE:
-                await self._run_message_task(
+                await self._advance_running_message_task(
                     owner_agent=owner_agent,
                     task=task,
                 )
             case TaskStateKind.TOOL:
-                await self._continue_tool_task(
+                await self._advance_running_tool_task(
                     owner_agent=owner_agent,
                     owner_state=owner_state,
                     task=task,
@@ -640,7 +707,7 @@ class BaseRuntime:
         # 部分或者全部执行完成，checkpoint 保存状态
         await self._override_service_commit_runtime_checkpoint()
 
-    async def _run_message_task(
+    async def _advance_running_message_task(
         self,
         owner_agent: BaseAgent,
         task: BaseProcessingTask,
@@ -664,14 +731,13 @@ class BaseRuntime:
         assistant_message = await self._override_service_generate_assistant_message(
             owner_agent=owner_agent,
             task=task,
-            no_tool_call=message_state.no_tool_call
         )
         message_state.message = assistant_message
 
         # 完成状态，由 Runtime 推进后续流程
         message_state.status = TaskStatus.COMPLETED
 
-    async def _continue_tool_task(
+    async def _advance_running_tool_task(
         self,
         owner_agent: BaseAgent,
         owner_state: BaseAgentState,
@@ -703,6 +769,7 @@ class BaseRuntime:
         execution_result = await owner_agent.tool_provider.execute_unit(
             context=ToolExecutionContext(
                 agent=owner_agent,
+                agent_name2agent=self.agent_name2agent,
                 owner_state=owner_state,
                 session_state=self.session_state,
                 task=task,
@@ -727,15 +794,45 @@ class BaseRuntime:
                 owner_agent=owner_agent,
                 owner_state=owner_state,
                 task=task,
-                task_switch_action=execution_result.task_switch_action,
+                execution_result=execution_result,
             )
+
+    async def _start_new_task(
+        self,
+        owner_state: BaseAgentState,
+        start_input: Input | None = None,
+    ) -> None:
+        """创建一个刚由新输入触发的任务，后续执行由 Runtime 驱动
+
+        参数:
+            owner_agent: 当前 Owner Agent。
+            owner_state: 当前 Owner Agent 对应状态。
+
+        说明:
+            当前阶段新输入只会先进入 MessageState。
+            也就是说，该方法负责的是“从输入创建任务并开始首轮执行”，
+            这里不会直接启动一个已经处于 ToolState 等中间现场的任务。
+        """
+        current_input = start_input or await self._pop_input()
+        task = self._create_task_from_input(owner_state, current_input)
+        owner_state.processing_tasks.append(task)
+
+        # 调用完成
+        await self._override_service_input_did_process(
+            task=task,
+            agent_name=owner_state.agent_name,
+            processed_input=current_input,
+        )
+
+        # 任务创建完成进行状态保存
+        await self._override_service_commit_runtime_checkpoint()
 
     async def _handle_task_switch_action(
         self,
         owner_agent: BaseAgent,
         owner_state: BaseAgentState,
         task: BaseProcessingTask,
-        task_switch_action: TaskSwitchAction,
+        execution_result: ExecutionUnitResult,
     ) -> None:
         """处理执行结果要求 Runtime 接管的任务级切换动作。
 
@@ -743,7 +840,8 @@ class BaseRuntime:
             owner_agent: 当前 Owner Agent。
             owner_state: 当前 Owner Agent 对应状态。
             task: 当前触发切换的任务现场。
-            task_switch_action: 执行结果要求 Runtime 执行的任务级切换动作。
+            execution_result: 当前执行单元结果；其中的任务切换动作与原始数据共同
+                决定 Runtime 的后续处理。
 
         返回:
             无返回值。
@@ -753,6 +851,11 @@ class BaseRuntime:
         """
 
         _ = (owner_agent, owner_state)
+        task_switch_action = ensure_instance(
+            execution_result.task_switch_action,
+            TaskSwitchAction,
+            "执行结果中的任务切换动作",
+        )
         match task_switch_action:
             case TaskSwitchAction.PAUSE:
                 task.state.status = TaskStatus.PAUSED
@@ -763,38 +866,97 @@ class BaseRuntime:
                     owner_state=owner_state,
                     task=task,
                 )
+            case TaskSwitchAction.PUSH_EVENT:
+                event = ensure_instance(
+                    (execution_result.raw_data or {}).get(K_RAW_DATA_EVENT),
+                    ObservableEvent,
+                    "工具执行结果中的待推送事件",
+                )
+
+                # 经 Runtime 统一入队，确保内存队列与持久化 input_queue 保持一致。
+                await self._push_input(
+                    Input(
+                        input_id=generate_prefixed_id(PREFIX_INPUT_ID),
+                        events=[event],
+                    )
+                )
             case _:
                 raise KernelUnsupportedOperationError(
                     f"当前 BaseRuntime 暂不支持该任务切换动作：{task_switch_action}"
                 )
 
-    async def _advance_completed_tool_task(
+    async def _change_agent_frame(
         self,
         owner_agent: BaseAgent,
-        owner_state: BaseAgentState,
         task: BaseProcessingTask,
+        frame_change: BaseAgentFrameChange,
     ) -> None:
-        """推进已闭合 ToolState 的最终落历史动作。
+        """执行 Agent frame 的 push 或 pop，并在 push 后唤起目标 Agent。
 
         参数:
-            owner_agent: 当前 Owner Agent。
-            owner_state: 当前 Owner Agent 对应状态。
-            task: 当前已闭合、待收尾的工具循环任务。
+            owner_agent: 发起本次控制权变更的当前 Agent。
+            task: 触发控制权变更的已完成任务。
+            frame_change: 包含来源、目标与变更类型的稳定 frame 变更产物。
+
+        返回:
+            无返回值。
+
+        异常:
+            KernelRuntimeError: 当前控制权栈顶与 frame 变更来源不一致，或变更类型不支持时抛出。
 
         说明:
-            ToolState 在所有 execution unit 闭合时已经保存“任务完成 checkpoint”。
-            这里仅负责把稳定结果整理进 history 并移除任务，不再重复 checkpoint。
+            handoff 不会向目标 Agent 重复投递原始用户文本。目标 Agent 接收空 user input，
+            由上下文投影将来源 Agent 已形成的历史收敛为 Group Input 注入当前任务。
         """
-    
-        # 由子类实现会话历史的生成和持久化
-        await self._override_service_save_task_history(
+
+        if self.session_state.agent_frames[-1].agent_name != frame_change.source:
+            raise KernelRuntimeError(
+                "当前 agent frame 不匹配："
+                f"source={frame_change.source}, "
+                f"top_frame={self.session_state.agent_frames[-1].agent_name}"
+            )
+
+        if frame_change.type == AgentFrameChangeType.PUSH:
+            self.session_state.agent_frames.append(
+                AgentFrame(
+                    agent_name=frame_change.target,
+                    from_agent_name=self.session_state.agent_frames[-1].agent_name,
+                )
+            )
+
+            # handoff 只重新触发目标 Agent，不重复投递用户原始文本。
+            source_input = task.start_input
+            if source_input:
+                await self._push_input(
+                    Input(
+                        input_id=generate_prefixed_id(PREFIX_INPUT_ID),
+                        origin_input_id=source_input.input_id,
+                        events=[
+                            ObservableEvent(
+                                event_id=generate_prefixed_id(
+                                    PREFIX_OBSERVABLE_EVENT_ID
+                                ),
+                                event_type=EventType.USER_INPUT,
+                                source=EventSource.HANDOFF,
+                                payload=UserInputPayload(),
+                            )
+                        ],
+                    )
+                )
+        elif frame_change.type == AgentFrameChangeType.POP:
+            self.session_state.agent_frames.pop()
+        else:
+            raise KernelRuntimeError(f"不支持的 frame_change.type：{frame_change.type}")
+
+        # 通知 frame change 完成
+        await self._override_service_agent_frame_did_change(
             owner_agent=owner_agent,
-            owner_state=owner_state,
-            task=task,
+            source_task=task,
+            frame_change=frame_change,
         )
 
-        # ToolState 闭合后，统一基于过滤后的消息写入 history，并移除任务现场。
-        self._pop_task(owner_state=owner_state, task_id=task.task_id)
+    def _pop_agent_frame(self):
+        self.session_state.agent_frames.pop()
 
     def _pick_next_execution_unit(self, tool_state: ToolState) -> ExecutionUnit | None:
         """从 `ToolState` 中选出下一个可推进的执行单元。
@@ -813,24 +975,6 @@ class BaseRuntime:
                 return execution_unit
             
         return None
-
-    def _pop_task(self, owner_state: BaseAgentState, task_id: str) -> None:
-        """从当前 BaseAgentState 中移除指定任务。
-
-        参数:
-            owner_state: 当前 Owner Agent 对应状态。
-            task_id: 需要移除的任务 id。
-
-        说明:
-            当前实现按 `task_id` 过滤任务列表；输入归属由任务状态自行持有，
-            因此移除任务时不再清理会话级 current input。
-        """
-
-        owner_state.processing_tasks = [
-            processing_task
-            for processing_task in owner_state.processing_tasks
-            if processing_task.task_id != task_id
-        ]
 
     def _clear_interruption_request(self, task: BaseProcessingTask):
         if task.state.status != TaskStatus.PAUSED:

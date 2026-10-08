@@ -247,8 +247,12 @@ class OpenAIClient(BaseLLMClient):
             Logger.logger.warning(
                 f"LLM 调用收到 stream={request_kwargs.get('stream')}，已强制覆盖为 stream={stream}"
             )
+            
+        # 流式输出用量
         request_kwargs["stream"] = stream
-        if tools is not None:
+        if stream:
+            request_kwargs["stream_options"] = {"include_usage": True}
+        if tools:
             request_kwargs["tools"] = tools
         if tool_choice is not None:
             request_kwargs["tool_choice"] = tool_choice
@@ -298,9 +302,14 @@ class OpenAIClient(BaseLLMClient):
 
         normalized_messages: list[dict[str, object]] = []
         for message in messages:
+
+            # 后续模型调用只消费 context 通道；未经过拦截器的普通消息回退原始文本。
+            content = message.context_content
+            if content is None:
+                content = message.content
             normalized_message: dict[str, object] = {
                 "role": message.role.value,
-                "content": message.content,
+                "content": content,
             }
             if message.tool_call_id is not None:
                 normalized_message["tool_call_id"] = message.tool_call_id

@@ -11,16 +11,21 @@
 
 from __future__ import annotations
 
+import re
 from typing import ClassVar
 
 from pydantic import BaseModel, Field
 
+from turtlemap.kernel.models.enums import TaskStatus
 from turtlemap.kernel.tool import ToolDescriptor, ToolMetadata, ToolResult
 from turtlemap.kernel.tool.models import ToolFactSourceType
+from turtlemap.os.tool.enums import BuiltinToolCapabilityCategory
+from turtlemap.os.tool.model import ToolInputContext
+from turtlemap.shared.typing import ensure_instance
 
 from .base import BuildinTool
 
-K_TOOL_NAME_RECOLLECTION = "recollection"
+K_TOOL_NAME_RECOLLECTION = "_recollection"
 
 
 class RecollectionQuery(BaseModel):
@@ -63,11 +68,12 @@ class RecollectionTool(BuildinTool[RecollectionQuery]):
         """初始化系统级历史回忆工具。"""
 
         descriptor = ToolDescriptor(
-            name=self.TOOL_NAME,
-            capability="回忆可能相关的历史会话内容，用于补充当前对话历史和 Memory Context 不足的事实。",
+            summary="检索历史会话与中断任务信息。",
+            capability_category=BuiltinToolCapabilityCategory.MEMORY.value,
+            capability="回忆可能相关的历史会话、任务信息等相关信息，用于补充当前对话历史和 Memory Context 不足的事实。",
             use_cases=[
                 "用户明确询问过去会话中讨论过、决定过或实现过的内容",
-                "用户使用“之前”“上次”“我们当时”等表达，且当前对话历史与 Memory Context 不足以回答",
+                "用户使用“之前”、“上次”、“我们当时”等表达，且当前对话历史与 Memory Context 不足以回答",
                 "用户的提问有明显的回忆意图，如：“你想一想”，“回忆一下”，且涉及的内容不在当前上下文中",
             ],
             anti_use_cases=[
@@ -76,11 +82,10 @@ class RecollectionTool(BuildinTool[RecollectionQuery]):
                 "用户只是要求解释、总结、修改当前对话中已经出现的内容时，禁止调用",
                 "用户问题没有明确指向过去会话或历史记忆时，禁止调用",
             ],
-            tags=["回忆", "recollection"],
         )
         super().__init__(
             tool_metadata=ToolMetadata.model(
-                name=descriptor.name,
+                name=self.TOOL_NAME,
                 input_model=RecollectionQuery,
             ),
             tool_descriptor=descriptor,
@@ -96,16 +101,97 @@ class RecollectionTool(BuildinTool[RecollectionQuery]):
 
         返回:
             可回传给 LLM 的标准工具结果。
+
+        说明:
+            查询文本同时包含“任务”与“中断”或“暂停”时，会读取当前 Agent 下
+            仍处于暂停状态的任务；其他查询不会访问运行期任务现场。
         """
 
+        from turtlemap.os.context.prompt import build_markdown_section, join_prompt_sections
+
+        sections: list[str] = []
+
+        # 中断任务信息
+        interruption_tasks_section = self._build_interruption_tasks_section(input_model)
+        if interruption_tasks_section:
+            sections.append(interruption_tasks_section)
+
+        # 检索结果
+        retrieval_result = f"没有找到与“{input_model.query}”相关的可用历史信息。"
+        if retrieval_result:
+            sections.append(
+                build_markdown_section(
+                    "检索结果",
+                    retrieval_result,
+                    heading_level=1,
+                )
+            )
+
         return ToolResult(
-            content=f"没有找到与“{input_model.query}”相关的可用历史信息。",
+            content=join_prompt_sections(sections),
             fact_source_type=ToolFactSourceType.RECOLLECTION,
             purpose="retrieve relevant information from past conversations",
             raw_data={
                 "query": input_model.query,
                 "retrieval_queries": input_model.retrieval_queries,
-                "mock": True,
-                "matched": False,
             },
+        )
+
+    @staticmethod
+    def _build_interruption_tasks_section(input_model: RecollectionQuery) -> str:
+        """按回忆查询构建当前 Agent 的中断任务区块。
+
+        参数:
+            input_model: 已绑定工具运行期上下文的回忆查询参数。
+
+        返回:
+            查询明确指向暂停或中断任务时，返回包含当前未响应暂停任务的一级
+            Markdown 区块；未命中查询意图或没有可展示任务时返回空字符串。
+        """
+
+        # 当前仅在检索意图明确指向暂停或中断任务时读取运行现场，避免普通回忆查询暴露任务状态。
+        if "任务" not in input_model.query:
+            return ""
+
+        from turtlemap.os.context.prompt import (
+            build_interruption_request_description,
+            build_markdown_section,
+            join_prompt_sections,
+        )
+        from turtlemap.os.tool.build_in.resume_task import K_TOOL_NAME_RESUME_TASK
+        from turtlemap.os.tool.service import ToolService
+
+        context = ensure_instance(
+            ToolInputContext.get_input_context(input_model),
+            ToolInputContext,
+            "回忆工具输入上下文",
+        )
+        tool_service = ensure_instance(
+            context.tool_service,
+            ToolService,
+            "回忆工具服务",
+        )
+        agent_state = tool_service.os_service.real_session_state.top_agent_state()
+        interruption_task_descriptions: list[str] = []
+        for task in agent_state.processing_tasks:
+            request = task.interruption_request
+            if task.state.status != TaskStatus.PAUSED or request is None:
+                continue
+            if request.response is not None:
+                continue
+
+            interruption_request_description = build_interruption_request_description(
+                request=request,
+                resume_tool_name=K_TOOL_NAME_RESUME_TASK,
+            )
+            interruption_task_descriptions.append(
+                f"【任务 {len(interruption_task_descriptions) + 1}】：\n"
+                f"{interruption_request_description}"
+            )
+
+        interruption_tasks = join_prompt_sections(interruption_task_descriptions)
+        return build_markdown_section(
+            "中断的任务",
+            interruption_tasks,
+            heading_level=1,
         )

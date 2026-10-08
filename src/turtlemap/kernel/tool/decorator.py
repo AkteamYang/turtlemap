@@ -33,6 +33,7 @@ ToolCallbackResult: TypeAlias = ToolResult | str | Awaitable[ToolResult | str]
 
 def tool(
     *,
+    name: str,
     descriptor: ToolDescriptor,
     input_model: type[InputModelT],
     tool_id: str | None = None,
@@ -46,9 +47,10 @@ def tool(
     """把普通函数装配成可被 Runtime 注册的最小工具。
 
     参数:
+        name: 工具对模型暴露的稳定名称。
         descriptor: 工具创建侧的结构化语义描述对象。
         input_model: 工具输入模型；无参工具应传入 `EmptyToolInputModel`。
-        tool_id: 可选工具稳定 id；未提供时默认使用 `descriptor.name`。
+        tool_id: 可选工具稳定 id；未提供时默认使用 `name`。
         version: 可选工具版本。
         namespace: 可选工具命名空间。
         requires_confirmation: 是否必须在工具执行前获得用户确认。
@@ -64,7 +66,7 @@ def tool(
     """
 
     metadata = ToolMetadata.model(
-        name=descriptor.name,
+        name=name,
         input_model=input_model,
         tool_id=tool_id,
         version=version,

@@ -53,12 +53,18 @@ class ModelClientProtocol(Protocol):
         self,
         messages: list[LLMMessage],
         tool_schemas: list[dict[str, object]] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        top_p: float | None = None,
     ) -> LLMMessage:
         """执行一次普通或带工具的模型推理。
 
         参数:
             messages: 当前轮传给模型的 LLM 消息列表。
             tool_schemas: 当前轮可供模型选择的工具描述列表；为空时表示纯文本推理。
+            temperature: 当前调用的采样温度；为空时不向底层 LLM 传递。
+            max_tokens: 当前调用的最大输出 token 数；为空时不向底层 LLM 传递。
+            top_p: 当前调用的 nucleus sampling 参数；为空时不向底层 LLM 传递。
 
         返回:
             模型返回的 assistant 消息对象。
@@ -71,6 +77,9 @@ class ModelClientProtocol(Protocol):
         messages: list[LLMMessage],
         tool_schemas: list[dict[str, object]] | None = None,
         tool_choice: LLMToolChoice | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        top_p: float | None = None,
     ) -> AsyncIterable[LLMCompletionChunk]:
         """执行一次普通或带工具的流式模型推理。
 
@@ -78,6 +87,9 @@ class ModelClientProtocol(Protocol):
             messages: 当前轮传给模型的 LLM 消息列表。
             tool_schemas: 当前轮可供模型选择的工具描述列表；为空时表示纯文本推理。
             tool_choice: 当前轮工具选择策略；为空时由实现按工具列表决定默认策略。
+            temperature: 当前调用的采样温度；为空时不向底层 LLM 传递。
+            max_tokens: 当前调用的最大输出 token 数；为空时不向底层 LLM 传递。
+            top_p: 当前调用的 nucleus sampling 参数；为空时不向底层 LLM 传递。
 
         返回:
             逐段产出模型流式响应 chunk 的异步可迭代对象。
@@ -110,19 +122,16 @@ class StateStoreProtocol(Protocol):
 
         ...
 
-    async def load_agent_long_term_memory(
+    async def load_session_long_term_memory(
         self,
         session_state: BaseSessionState,
-        agent_name: str,
     ) -> str:
-        """加载指定 Agent 当前生效的长期记忆文本。
+        """加载当前会话生效的长期记忆文本。
 
         参数:
             session_state: 当前会话状态；实现可收窄为 os SessionState 读取用户维度。
-            agent_name: 待加载长期记忆的 Agent 名称。
-
         返回:
-            当前 Agent 在跨会话维度上的长期记忆文本。
+            当前会话在跨会话维度上的长期记忆文本。
         """
 
         ...

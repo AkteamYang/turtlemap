@@ -27,6 +27,8 @@ from turtlemap.kernel.models.models import BaseAgentState, InterruptionRequest
 from turtlemap.kernel.tool.service import ExecutableTool
 from turtlemap.os.event_bus.collector import ResultCollector
 from turtlemap.os.event_bus.event_bus import EventBus
+from turtlemap.os.event_bus.message_publisher import MessagePublisher
+from turtlemap.os.interceptor.context import AgentInterceptorContext
 from turtlemap.os.event_bus.models import (
     InputEvent,
     InterruptedEvent,
@@ -35,6 +37,7 @@ from turtlemap.os.event_bus.models import (
     RuntimeEventPhase,
 )
 from turtlemap.os.llm.model import LLMCompletionChunk, LLMToolChoice
+from turtlemap.os.interceptor.executor import InterceptorExecutor
 from turtlemap.os.context.models import (
     ContextBuildInput,
     ContextBuildResult,
@@ -51,6 +54,7 @@ from turtlemap.shared.logger import Logger
 from turtlemap.shared.typing import ensure_instance
 from .context.provider import ContextBuildProvider
 from .context.compress import ContextCompressionProvider
+from .context.tokenizer import Tokenizer
 from .exceptions import OSErrorBase, OSRuntimeError
 from .executor import NoopExecutor
 from .store import InMemoryStateStore
@@ -70,20 +74,30 @@ class OSService:
 
     def __init__(
         self,
+        session_state: SessionState,
         config: TurtleMapConfig | None = None,
         event_bus_id: str = "",
         state_store: StateStoreProtocol | None = None,
+        interceptor_executor: InterceptorExecutor | None = None,
     ) -> None:
         """初始化 OSService。
 
         参数:
             config: 当前 Runtime 使用的完整应用配置；为空时从环境变量读取。
+            session_state: 当前 Runtime 绑定的 os 层会话状态。
             event_bus_id: 当前 Runtime 绑定的事件通道标识。
             state_store: 可选状态存储实现；为空时使用默认 InMemoryStateStore。
+            interceptor_executor: 当前 Runtime 的 interceptor 调度器；为空时不启用拦截。
         """
         self.event_bus_id = event_bus_id
-        self.session_state: SessionState | None = None
+        self.session_state = session_state
         self.collector: ResultCollector | None = None
+
+        # 所有 LLM 消息事件必须经由 publisher，保证截流状态与转发顺序一致。
+        self.message_publisher = MessagePublisher(
+            event_bus_id=event_bus_id,
+            interceptor_executor=interceptor_executor or InterceptorExecutor([]),
+        )
 
         # OSService 持有完整配置，再分发给 LLM、上下文压缩等具体 provider。
         effective_config = config or TurtleMapConfig.from_env()
@@ -113,6 +127,7 @@ class OSService:
         # 上下文构建
         self.context_build_provider: ContextBuildProtocol = ContextBuildProvider(
             compression_provider=self.compression_provider,
+            tokenizer=Tokenizer(model_name=effective_config.llm.tokenizer_model),
         )
 
     @property
@@ -125,14 +140,12 @@ class OSService:
 
     async def load_session_state(
         self,
-        session_state: BaseSessionState,
         root_agent: BaseAgent,
         resume: bool = True,
     ) -> SessionState:
         """校验并装配 os 层 SessionState。
 
         参数:
-            session_state: 外部业务层已加载或创建的会话状态对象。
             root_agent: 当前 Runtime 的根 Agent，用于解析可达 Agent 集合。
             resume: 是否保留未消费输入与运行中任务，用于继续上次中断的运行。
 
@@ -140,7 +153,7 @@ class OSService:
             已装配 BaseAgentState 的 SessionState。
         """
 
-        session_state = ensure_instance(session_state, SessionState, "会话状态")
+        session_state = self.real_session_state
         agent_name2agent = root_agent.resolve_reachable_agents()
 
         # 持久化状态已包含 AgentState；这里再按当前代码中的 Agent 图校验并补齐。
@@ -155,17 +168,24 @@ class OSService:
             root_agent=root_agent,
         )
 
-        self.session_state = session_state
+        # pending 任务仅用于衔接近期输入；按原始顺序只保留最后 5 个，避免长期累积。
+        for agent_state in session_state.agent_name2agent_state.values():
+            pending_task_count = 0
+            retained_reversed_tasks: list[BaseProcessingTask] = []
+            for task in reversed(agent_state.processing_tasks):
+                if task.state.status == TaskStatus.PAUSED:
+                    if pending_task_count >= 5:
+                        continue
+                    pending_task_count += 1
+                retained_reversed_tasks.append(task)
+            agent_state.processing_tasks = list(reversed(retained_reversed_tasks))
 
-        # 非恢复运行只继承稳定 history，丢弃未消费输入与未结束的运行现场。
-        if not resume:
-            session_state.input_queue = []
-            top_agent_state = session_state.top_agent_state()
-            top_agent_state.processing_tasks = [
-                task
-                for task in top_agent_state.processing_tasks
-                if not task.state.is_running
-            ]
+        # 长期记忆进入会话级 MemoryView，不按 Agent 复制加载。
+        session_state.memory.long_term_memory = (
+            await self._state_store.load_session_long_term_memory(
+                session_state=session_state,
+            )
+        )
 
         # 移除无效任务
         for _, agent_state in session_state.agent_name2agent_state.items():
@@ -179,6 +199,10 @@ class OSService:
                         f"Processing tasks检查：event_buffer首元素不是InputEvent，task无效被移除，task_id: {p.task_id}"
                     )
             agent_state.processing_tasks = processing_tasks
+
+        # 非恢复运行只继承稳定 history，丢弃未消费输入与未结束的运行现场。
+        if not resume:
+            session_state.clean_state()
 
         # run_id 是当前 run 的运行批次标识，每次运行时重新生成。
         session_state.run_id = generate_prefixed_id(PREFIX_RUN_ID)
@@ -252,6 +276,7 @@ class OSService:
             owner_agent=effective_owner_agent,
             owner_agent_state=owner_state,
             task=task,
+            event_bus_id=self.event_bus_id,
             available_tools=available_executable_tools,
         )
         context_result = await self.context_build_provider.build_llm_context(
@@ -261,25 +286,31 @@ class OSService:
         # 发送 messagee 开始生成事件
         message_event_id = generate_prefixed_id(PREFIX_EVENT_ID)
         async def publish_event(event_phase: RuntimeEventPhase, chunk: LLMCompletionChunk | None = None):
-            await ProcessingTask.publish(
-                task,
-                self.event_bus_id,
-                MessageEvent(
+            await self.message_publisher.publish(
+                context=AgentInterceptorContext(
+                    agent=effective_owner_agent,
+                    session_state=self.real_session_state,
+                    task=ensure_instance(task, ProcessingTask, "消息事件所属任务"),
+                ),
+                event=MessageEvent(
                     event_id=message_event_id,
                     session_id=self.real_session_state.session_id,
                     agent_name=effective_owner_agent.agent_name,
+                    agent_display_name=effective_owner_agent.name,
                     task_id=task.task_id,
                     event_phase=event_phase,
-                    chunk=chunk
-                )
+                    chunk=chunk,
+                ),
             )
         await publish_event(RuntimeEventPhase.STARTED)
         
         # 发送 messagee 过程事件
         async for chunk in self.model_client_provider.stream_generate_message(
             messages=context_result.messages,
-            tool_schemas=context_result.tool_schemas,
-            tool_choice=tool_choice
+            tool_schemas=context_result.tool_schemas or None,
+            tool_choice=tool_choice,
+            temperature=0.7,
+            max_tokens=4*1024
         ):
             await publish_event(RuntimeEventPhase.IN_PROGRESS, chunk)
         
@@ -294,7 +325,18 @@ class OSService:
         if final_event.completion is None or not final_event.completion.choices:
             raise OSRuntimeError("LLM 未能生成有效消息")
 
+        # 无可用工具时仍返回 tool_calls 属于模型协议违例，丢弃后按普通消息继续处理。
+        if not context_result.tool_schemas and final_event.completion.choices[0].message.tool_calls:
+            Logger.logger.warning(
+                "LLM 在未提供工具 schema 时返回了 tool_calls，已丢弃："
+                f"agent={effective_owner_agent.agent_name}, "
+                f"task_id={task.task_id}, "
+                f"tool_calls={final_event.completion.choices[0].message.tool_calls}"
+            )
+            final_event.completion.choices[0].message.tool_calls = []
+
         assistant_message = final_event.completion.choices[0].message
+        assistant_message.available_funtion_names = [t.tool_metadata.id for t in available_executable_tools]
         artifact_type = (
             RuntimeArtifactType.TOOL_CALL
             if assistant_message.tool_calls
@@ -308,6 +350,7 @@ class OSService:
         )
         return RuntimeArtifact(
             type=artifact_type,
+            owner_agent_name=effective_owner_agent.agent_name,
             payload=assistant_message,
         )
 
@@ -366,21 +409,10 @@ class OSService:
             无返回值。
         """
 
-        # 清理运行标记
-        self.real_session_state.run_id = ""
+        # 清理state
+        self.real_session_state.clean_state()
 
-        # pending 任务仅用于衔接近期输入；按原始顺序保留最后 5 个，避免长期累积。
-        for agent_state in self.real_session_state.agent_name2agent_state.values():
-            pending_task_count = 0
-            retained_reversed_tasks: list[BaseProcessingTask] = []
-            for task in reversed(agent_state.processing_tasks):
-                if task.state.status == TaskStatus.PAUSED:
-                    if pending_task_count >= 5:
-                        continue
-                    pending_task_count += 1
-                retained_reversed_tasks.append(task)
-            agent_state.processing_tasks = list(reversed(retained_reversed_tasks))
-
+        # 持久化
         await self.save_session_state(
             save_kind=SessionStateSaveKind.CHECKPOINT,
         )
@@ -396,32 +428,51 @@ class OSService:
             await OSService._save_session_state(session_state, state_store, SessionStateSaveKind.REFRESH)
 
     async def perform_interruption_request(
-            self,
-            task: ProcessingTask,
-            agent_name: str,
-            type: InterruptionRequestType,
-            reason: str,
-            request_params: dict
-            ) -> Tuple[InterruptionRequest, InterruptedEvent]:
+        self,
+        task: ProcessingTask,
+        agent_name: str,
+        agent_display_name: str,
+        type: InterruptionRequestType,
+        assistant_content: str,
+        request_params: dict,
+        resume_prompt: str,
+    ) -> Tuple[InterruptionRequest, InterruptedEvent]:
+        """创建中断请求、暂停任务并发布对应中断事件。
+
+        参数:
+            task: 当前需要暂停并等待恢复的任务。
+            agent_name: 当前任务所属 Agent 名称。
+            agent_display_name: 当前任务所属 Agent 的对外展示名称。
+            type: 中断请求的稳定类型。
+            assistant_content: 作为中断任务历史沉淀的 assistant 文本。
+            request_params: 外部恢复处理所需的结构化参数。
+            resume_prompt: 引导模型恢复任务的明确提示。
+
+        返回:
+            已挂载到任务上的中断请求及其 Runtime 中断事件。
+        """
+
         request_id = generate_prefixed_id(PREFIX_INTERRUPTION_REQUEST_ID)
         interruption_request = InterruptionRequest(
             request_id=request_id,
             task_id=task.task_id,
             type=type,
             origin_task_status=task.state.status,
-            reason=reason,
+            assistant_content=assistant_content,
+            resume_prompt=resume_prompt,
             params=request_params,
         )
         task.interruption_request = interruption_request
         event = InterruptedEvent(
-                        event_id=generate_prefixed_id(PREFIX_EVENT_ID),
-                        session_id=self.real_session_state.session_id,
-                        agent_name=agent_name,
-                        task_id=task.task_id,
-                        event_phase=RuntimeEventPhase.FINAL,
-                        interruption_type=type,
-                        payload=interruption_request,
-                    )
+            event_id=generate_prefixed_id(PREFIX_EVENT_ID),
+            session_id=self.real_session_state.session_id,
+            agent_name=agent_name,
+            agent_display_name=agent_display_name,
+            task_id=task.task_id,
+            event_phase=RuntimeEventPhase.FINAL,
+            interruption_type=type,
+            payload=interruption_request,
+        )
         await ProcessingTask.publish(
             task,
             self.event_bus_id,
@@ -429,7 +480,9 @@ class OSService:
         )
         return interruption_request, event
 
-
+    def save_finished_task_evnets(self, task: ProcessingTask):
+        task.event_buffer.events = self._filter_runtime_events_before_save(task.event_buffer.events)
+        self.real_session_state.finished_task_events.append(task.event_buffer)
 
     async def _merge_background_compression_result(
         self,
@@ -447,16 +500,11 @@ class OSService:
         返回:
             无返回值；若目标状态已变化导致无法安全合并，则由具体合并路径跳过写入。
         """
-        latest_owner_state = session_state.agent_name2agent_state.get(
-            owner_agent.agent_name
+        # 先更新当前运行态，未完成任务后续 LLM 调用可直接使用压缩后的会话上下文。
+        compression_result.merged = ContextCompressionProvider.merge_compacted_result(
+            session_state=session_state,
+            compression_result=compression_result,
         )
-        if latest_owner_state is not None:
-
-            # 先更新当前运行态，未完成任务后续 LLM 调用可直接使用压缩后的上下文。
-            compression_result.merged = ContextCompressionProvider.merge_compacted_result(
-                owner_agent_state=latest_owner_state,
-                compression_result=compression_result,
-            )
 
         # store 层负责读取最新 session_state 并尝试合并保存，覆盖运行态已结束的回调场景。
         await self._state_store.save_context_compression_result(
@@ -482,10 +530,6 @@ class OSService:
 
         agent_name2state: dict[str, BaseAgentState] = {}
         for agent_name, runtime_agent in agent_name2agent.items():
-            long_term_memory = await self._state_store.load_agent_long_term_memory(
-                session_state=session_state,
-                agent_name=agent_name,
-            )
             loaded_state = session_state.agent_name2agent_state.get(agent_name)
             if loaded_state is None:
                 loaded_state = AgentState(
@@ -495,8 +539,6 @@ class OSService:
             # SystemDefinition 属于代码配置，每次恢复时都以当前运行时代码为准。
             loaded_state.system = runtime_agent.system
 
-            # 长期记忆属于跨会话主数据，每次加载时以 StateStore 当前值为准。
-            loaded_state.memory.long_term_memory = long_term_memory
             agent_name2state[agent_name] = loaded_state
         return agent_name2state
 
@@ -612,14 +654,6 @@ class OSService:
                 return
 
             is_last_frame = index == len(session_state.agent_frames) - 1
-
-            # 中间 frame 如果没有未完成任务，就说明控制权链已断，直接回退 root。
-            if not is_last_frame and not agent_state.processing_tasks:
-                self._reset_to_clean_root_session(
-                    session_state=session_state,
-                    root_agent=root_agent,
-                )
-                return
 
     @staticmethod
     def _reset_to_clean_root_session(

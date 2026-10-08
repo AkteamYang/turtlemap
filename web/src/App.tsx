@@ -3,8 +3,8 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   AlertCircle,
-  Bot,
   Check,
+  ChevronRight,
   ChevronsLeft,
   ChevronsRight,
   CircleStop,
@@ -35,10 +35,10 @@ import {
   buildChatItemPresentation,
   createChatItem,
   formatDuration,
+  getChatItemAgentName,
   hasLiveCompletion,
   historyToItems,
   markStreamingItemsError,
-  refreshLiveCompletionDurations,
   setHistoryExpanded,
 } from "./chatState";
 import type {
@@ -56,6 +56,29 @@ import type {
 
 const ACTIVE_SESSION_KEY = "turtlemap.activeSessionId";
 const LOCAL_AVATAR_URL = "/avatar.png";
+
+/** 生成兼容旧版移动端浏览器的客户端事件标识。 */
+function createClientEventId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+
+  // 按 RFC 4122 v4 写入版本号与变体位，保证服务端可按 UUID 格式处理。
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 /*
 const ACTIVITY_DEMO_BLOCK: ActivityLabelBlock = {
   type: "activity_label",
@@ -73,16 +96,27 @@ type DetailSelection = {
   title: string;
   role: string;
   taskId: string | null;
-  items: DetailItem[];
+  eventGroups: DetailEventGroup[];
 };
 
 type DetailItem = {
   id: string;
   title: string;
   eventType?: string;
+  isHistoryEvent: boolean;
+  isCollapsible: boolean;
+  inputEventType?: string;
+  toolName?: string;
+  compressionLevel?: number;
   status?: string;
   durationMs?: number;
   data: Record<string, unknown>;
+};
+
+type DetailEventGroup = {
+  id: string;
+  isHistoryEventForInterruption: boolean;
+  items: DetailItem[];
 };
 
 type ErrorFrameInfo = {
@@ -96,13 +130,15 @@ export function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [items, setItems] = useState<ChatItem[]>([]);
+  const [completionNow, setCompletionNow] = useState(() => Date.now());
   const [inputValue, setInputValue] = useState("");
   const [connectionState, setConnectionState] = useState<ConnectionState>("booting");
   const [errorText, setErrorText] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [detailPanelOpen, setDetailPanelOpen] = useState(false);
-  const [detailWidth, setDetailWidth] = useState(360);
+  const [detailWidth, setDetailWidth] = useState(420);
+
   const [detailSelection, setDetailSelection] = useState<DetailSelection | null>(null);
   const activeSessionRef = useRef<string | null>(null);
   const lastEventIdRef = useRef<string | null>(null);
@@ -116,9 +152,71 @@ export function App() {
   const processedEventKeysRef = useRef<Set<string>>(new Set());
   const streamFailedRef = useRef(false);
   const streamAbortControllerRef = useRef<AbortController | null>(null);
+  const composerFocusedRef = useRef(false);
+  const keyboardClosingRef = useRef(false);
+  const keyboardScrollFrameRef = useRef<number | null>(null);
+  const previousViewportHeightRef = useRef<number | null>(null);
+  const focusedViewportHeightRef = useRef<number | null>(null);
+  const keyboardCompensatedScrollTopRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    const syncViewportHeight = () => {
+      const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
+      const previousViewportHeight = previousViewportHeightRef.current;
+      previousViewportHeightRef.current = viewportHeight;
+      document.documentElement.style.setProperty("--app-height", `${viewportHeight}px`);
+      document.documentElement.style.setProperty("--mobile-detail-height", `${Math.round(viewportHeight * 0.8)}px`);
+
+      if (!composerFocusedRef.current || previousViewportHeight === null) {
+        return;
+      }
+
+      const messagesView = messagesViewRef.current;
+      if (messagesView !== null) {
+        // 使用上一帧目标 offset 推导下一帧，避免浏览器收起键盘时的自动边界裁剪造成重复补偿。
+        const currentScrollTop = keyboardCompensatedScrollTopRef.current ?? messagesView.scrollTop;
+        keyboardCompensatedScrollTopRef.current = currentScrollTop + previousViewportHeight - viewportHeight;
+      }
+      if (keyboardScrollFrameRef.current !== null) {
+        return;
+      }
+
+      keyboardScrollFrameRef.current = window.requestAnimationFrame(() => {
+        keyboardScrollFrameRef.current = null;
+        const currentMessagesView = messagesViewRef.current;
+        const targetScrollTop = keyboardCompensatedScrollTopRef.current;
+        if (composerFocusedRef.current && currentMessagesView !== null && targetScrollTop !== null) {
+          currentMessagesView.scrollTop = targetScrollTop;
+        }
+        if (
+          keyboardClosingRef.current
+          && focusedViewportHeightRef.current !== null
+          && (previousViewportHeightRef.current ?? 0) >= focusedViewportHeightRef.current - 1
+        ) {
+          composerFocusedRef.current = false;
+          keyboardClosingRef.current = false;
+          focusedViewportHeightRef.current = null;
+          keyboardCompensatedScrollTopRef.current = null;
+        }
+      });
+    };
+
+    syncViewportHeight();
+    window.addEventListener("resize", syncViewportHeight);
+    window.visualViewport?.addEventListener("resize", syncViewportHeight);
+    return () => {
+      window.removeEventListener("resize", syncViewportHeight);
+      window.visualViewport?.removeEventListener("resize", syncViewportHeight);
+      if (keyboardScrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(keyboardScrollFrameRef.current);
+      }
+      keyboardCompensatedScrollTopRef.current = null;
+    };
+  }, []);
 
   const activeSession = sessions.find((session) => session.session_id === activeSessionId) ?? null;
   const visibleItems = items.filter((item) => item.events.some((event) => event.type !== "complete"));
+  const visibleItemAgentNames = visibleItems.map(getChatItemAgentName);
   const isBusy = connectionState === "booting" || connectionState === "loading" || connectionState === "recovering" || connectionState === "streaming";
   const isSessionLoading = connectionState === "booting" || connectionState === "loading" || connectionState === "recovering";
   const isInputDisabled = connectionState === "booting" || connectionState === "loading" || connectionState === "recovering";
@@ -166,8 +264,9 @@ export function App() {
       return;
     }
 
+    setCompletionNow(Date.now());
     const intervalId = window.setInterval(() => {
-      setItems((current) => refreshLiveCompletionDurations(current));
+      setCompletionNow(Date.now());
     }, 1000);
 
     return () => {
@@ -345,7 +444,7 @@ export function App() {
       }
 
       const currentSessionId = sessionId;
-      const clientEventId = crypto.randomUUID();
+      const clientEventId = createClientEventId();
       resolvedSessionId = currentSessionId;
       streamController = createStreamController();
       streamFailedRef.current = false;
@@ -407,7 +506,7 @@ export function App() {
     shouldFollowOutputRef.current = true;
     setErrorText(null);
     setConnectionState("streaming");
-    const clientEventId = crypto.randomUUID();
+    const clientEventId = createClientEventId();
     setItems((current) => [...current, createChatItem({
       id: clientEventId,
       clientEventId,
@@ -451,6 +550,9 @@ export function App() {
   function handleMessagesScroll(event: UIEvent<HTMLElement>) {
     const target = event.currentTarget;
     shouldFollowOutputRef.current = isNearScrollBottom(target);
+    if (composerFocusedRef.current && keyboardScrollFrameRef.current === null) {
+      keyboardCompensatedScrollTopRef.current = target.scrollTop;
+    }
   }
 
   function scrollMessagesToBottom() {
@@ -530,7 +632,7 @@ export function App() {
       return;
     }
 
-    const eventKey = `${event.run_id}:${event.is_history_event ? "history" : "current"}:${frame.id ?? `${event.type}:${event.event_id}:${event.start_ts_ms}`}`;
+    const eventKey = `${event.run_id}:${event.is_history_event_for_interruption ? "history" : "current"}:${frame.id ?? `${event.type}:${event.event_id}:${event.start_ts_ms}`}`;
     if (processedEventKeysRef.current.has(eventKey)) {
       return;
     }
@@ -722,6 +824,14 @@ export function App() {
           </div>
         </div>
       </aside>
+      <button
+        className={`mobile-drawer-backdrop mobile-sidebar-backdrop ${sidebarOpen ? "is-open" : ""}`}
+        type="button"
+        onClick={() => setSidebarOpen(false)}
+        aria-label="关闭会话栏"
+        aria-hidden={!sidebarOpen}
+        tabIndex={sidebarOpen ? 0 : -1}
+      />
 
       <main className="chat-panel">
         <header className="topbar">
@@ -777,6 +887,12 @@ export function App() {
               <TaskItemView
                 key={item.id}
                 item={item}
+                completionNow={completionNow}
+                showAgentName={
+                  index > 0
+                  && visibleItemAgentNames[index] !== null
+                  && visibleItemAgentNames[index] !== visibleItemAgentNames[index - 1]
+                }
                 mergeCompletionIntoInterruption={isInterruptedThenRecovered(item, visibleItems[index + 1])}
                 selectedId={detailSelection?.id ?? null}
                 onSelectBlock={(block) => {
@@ -803,6 +919,24 @@ export function App() {
               value={inputValue}
               onChange={(event) => setInputValue(event.target.value)}
               onKeyDown={handleInputKeyDown}
+              onFocus={() => {
+                composerFocusedRef.current = true;
+                keyboardClosingRef.current = false;
+                previousViewportHeightRef.current = window.visualViewport?.height ?? window.innerHeight;
+                focusedViewportHeightRef.current = previousViewportHeightRef.current;
+                keyboardCompensatedScrollTopRef.current = messagesViewRef.current?.scrollTop ?? null;
+              }}
+              onBlur={() => {
+                const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
+                const focusedViewportHeight = focusedViewportHeightRef.current;
+                if (focusedViewportHeight === null || viewportHeight >= focusedViewportHeight - 1) {
+                  composerFocusedRef.current = false;
+                  focusedViewportHeightRef.current = null;
+                  keyboardCompensatedScrollTopRef.current = null;
+                } else {
+                  keyboardClosingRef.current = true;
+                }
+              }}
               onCompositionStart={() => {
                 isComposingRef.current = true;
               }}
@@ -829,6 +963,17 @@ export function App() {
         </form>
       </main>
 
+      <button
+        className={`mobile-drawer-backdrop mobile-detail-backdrop ${detailPanelOpen ? "is-open" : ""}`}
+        type="button"
+        onClick={() => {
+          setDetailPanelOpen(false);
+          setDetailSelection(null);
+        }}
+        aria-label="关闭详情"
+        aria-hidden={!detailPanelOpen}
+        tabIndex={detailPanelOpen ? 0 : -1}
+      />
       <DetailPanel
         selection={detailSelection}
         onClose={() => setDetailPanelOpen(false)}
@@ -848,7 +993,11 @@ function ChatLoadingState({ label }: { label: string }) {
 }
 
 function EmptyChat({ onPrompt }: { onPrompt: (value: string) => void }) {
-  const prompts = ["帮我总结当前 TurtleMap 的运行流程", "演示一次带工具调用的回答", "解释会话恢复和 SSE 续接逻辑"];
+  const prompts = new Map([
+    ["演示一次带工具调用的回答", "我现在的位置"],
+    ["演示一次售后流程", "这个产品我不想要了"],
+    ["解释会话恢复和 SSE 续接逻辑", "解释会话恢复和 SSE 续接逻辑"],
+  ]);
   return (
     <div className="empty-chat">
       <div className="empty-mark">
@@ -857,9 +1006,9 @@ function EmptyChat({ onPrompt }: { onPrompt: (value: string) => void }) {
       <h1>TurtleMap Web</h1>
       <p>一个面向 Agent Runtime 调试和对话体验的工作台。</p>
       <div className="prompt-grid">
-        {prompts.map((prompt) => (
-          <button type="button" key={prompt} onClick={() => onPrompt(prompt)}>
-            {prompt}
+        {Array.from(prompts, ([label, prompt]) => (
+          <button type="button" key={label} onClick={() => onPrompt(prompt)}>
+            {label}
           </button>
         ))}
       </div>
@@ -869,6 +1018,8 @@ function EmptyChat({ onPrompt }: { onPrompt: (value: string) => void }) {
 
 function TaskItemView({
   item,
+  completionNow,
+  showAgentName,
   mergeCompletionIntoInterruption,
   selectedId,
   onSelectBlock,
@@ -876,6 +1027,8 @@ function TaskItemView({
   onInterruptionAction,
 }: {
   item: ChatItem;
+  completionNow: number;
+  showAgentName: boolean;
   mergeCompletionIntoInterruption: boolean;
   selectedId: string | null;
   onSelectBlock: (block: ChatMessageBlock) => void;
@@ -885,7 +1038,7 @@ function TaskItemView({
     action: InterruptedBlock["actions"][number],
   ) => void;
 }) {
-  const presentation = buildChatItemPresentation(item);
+  const presentation = buildChatItemPresentation(item, completionNow);
   const historyCount = presentation.historyBlocks.length;
   const completionDurationMs = mergeCompletionIntoInterruption
     ? presentation.currentBlocks.find((block) => block.type === "completion")?.durationMs
@@ -911,8 +1064,13 @@ function TaskItemView({
         </div>
       )}
       <div className="message-body">
+        {showAgentName && presentation.agentName && (
+          <div className="agent-label">
+            <span className="agent-name-pill">{presentation.agentName}</span>
+          </div>
+        )}
         {historyCount > 0 && (
-          <div className="history-section">
+          <div className={`history-section ${item.historyExpanded ? "history-expanded" : ""}`}>
             <button
               className="history-toggle"
               type="button"
@@ -923,19 +1081,21 @@ function TaskItemView({
             >
               {item.historyExpanded ? "收起任务" : `展开任务（${historyCount}）`}
             </button>
-            {item.historyExpanded && (
+            <div className={`history-content-shell ${item.historyExpanded ? "expanded" : ""}`}>
               <div className="history-content">
-                {presentation.historyBlocks.map((block) => (
-                  <MessageBlockView
-                    key={`history:${block.id}`}
-                    block={block}
-                    selected={selectedId === `${item.id}:${block.id}`}
-                    onSelect={() => onSelectBlock(block)}
-                    onInterruptionAction={onInterruptionAction}
-                  />
-                ))}
+                <div className="history-content-inner">
+                  {presentation.historyBlocks.map((block) => (
+                    <MessageBlockView
+                      key={`history:${block.id}`}
+                      block={block}
+                      selected={selectedId === `${item.id}:${block.id}`}
+                      onSelect={() => onSelectBlock(block)}
+                      onInterruptionAction={onInterruptionAction}
+                    />
+                  ))}
+                </div>
               </div>
-            )}
+            </div>
           </div>
         )}
         {currentBlocks.map((block) => (
@@ -968,7 +1128,13 @@ function MessageBlockView({
 }) {
   if (block.type === "text") {
     return (
-      <button className={`inspectable-block text-block ${block.display === "history_quote" ? "history-input" : ""} ${selected ? "selected" : ""}`} type="button" onClick={handleBlockClick}>
+      <div
+        className={`inspectable-block text-block ${block.display === "history_quote" ? "history-input" : ""} ${selected ? "selected" : ""}`}
+        role="button"
+        tabIndex={0}
+        onClick={handleTextBlockClick}
+        onKeyDown={handleTextBlockKeyDown}
+      >
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
           components={{
@@ -994,7 +1160,7 @@ function MessageBlockView({
         >
           {block.content || " "}
         </ReactMarkdown>
-      </button>
+      </div>
     );
   }
 
@@ -1020,6 +1186,25 @@ function MessageBlockView({
   return <ActivityLabel block={block} selected={selected} onSelect={handleBlockClick} />;
 
   function handleBlockClick(event: MouseEvent<HTMLButtonElement>) {
+    event.stopPropagation();
+    onSelect();
+  }
+
+  function handleTextBlockClick(event: MouseEvent<HTMLDivElement>) {
+    if (window.getSelection()?.toString()) {
+      return;
+    }
+
+    event.stopPropagation();
+    onSelect();
+  }
+
+  function handleTextBlockKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key !== "Enter" && event.key !== " ") {
+      return;
+    }
+
+    event.preventDefault();
     event.stopPropagation();
     onSelect();
   }
@@ -1135,33 +1320,115 @@ function DetailPanel({
             </div>
           </div>
           <div className="detail-list">
-            {selection.items.map((item) => (
-              <section className="detail-item" key={item.id}>
-                <div className="detail-item-title">
-                  {item.eventType ? (
-                    <>
-                      事件类型：<code>{item.eventType}</code>
-                    </>
-                  ) : item.title}
-                </div>
-                {(item.status || item.durationMs !== undefined) && (
-                  <div className="detail-badges">
-                    {item.status && (
-                      <div className={`detail-status detail-status-${normalizeDetailStatus(item.status)}`}>{item.status}</div>
-                    )}
-                    {item.durationMs !== undefined && (
-                      <div className="detail-duration">耗时 {formatDuration(item.durationMs)}</div>
-                    )}
-                  </div>
-                )}
-                <JsonViewer data={item.data} />
-                <ContextCompressionMemoryBox item={item} />
-              </section>
+            {selection.eventGroups.map((group, groupIndex) => (
+              <DetailEventGroupView
+                key={`${selection.id}:${group.id}`}
+                group={group}
+                startIndex={selection.eventGroups
+                  .slice(0, groupIndex)
+                  .reduce((count, previousGroup) => count + previousGroup.items.length, 0)}
+              />
             ))}
           </div>
         </>
       )}
     </aside>
+  );
+}
+
+function DetailEventGroupView({
+  group,
+  startIndex,
+}: {
+  group: DetailEventGroup;
+  startIndex: number;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const eventItems = group.items.map((item, index) => (
+    <DetailItemView key={item.id} item={item} index={startIndex + index} />
+  ));
+
+  if (!group.isHistoryEventForInterruption) {
+    return <div className="detail-event-group">{eventItems}</div>;
+  }
+
+  return (
+    <div
+      className={`detail-event-group detail-history-group detail-item ${expanded ? "detail-history-group-expanded" : ""}`}
+      data-history-event-for-interruption
+    >
+      <button
+        className="detail-item-toggle"
+        type="button"
+        onClick={() => setExpanded((current) => !current)}
+        aria-expanded={expanded}
+      >
+        <code className="detail-event-name">历史事件</code>
+        <span className="detail-item-spacer" />
+        <span className="detail-duration">{group.items.length} 条</span>
+        <ChevronRight className="detail-item-chevron" size={16} aria-hidden="true" />
+      </button>
+      <div className="detail-item-content-shell">
+        <div className="detail-history-group-content">{eventItems}</div>
+      </div>
+    </div>
+  );
+}
+
+function DetailItemView({
+  item,
+  index,
+}: {
+  item: DetailItem;
+  index: number;
+}) {
+  const [expanded, setExpanded] = useState(!item.isCollapsible);
+  const title = item.eventType ?? item.title;
+  const header = (
+    <>
+      <span className="detail-event-index">{index + 1}</span>
+      <code className="detail-event-name">{title}</code>
+      <span className="detail-item-spacer" />
+      {item.inputEventType && (
+        <span className="detail-input-event-type">{item.inputEventType}</span>
+      )}
+      {item.toolName && (
+        <span className="detail-tool-name">{item.toolName}</span>
+      )}
+      {item.compressionLevel !== undefined && (
+        <span className="detail-compression-level">L{item.compressionLevel}</span>
+      )}
+      {item.status && (
+        <span className={`detail-status detail-status-${normalizeDetailStatus(item.status)}`}>{item.status}</span>
+      )}
+      {item.durationMs !== undefined && (
+        <span className="detail-duration">{formatDuration(item.durationMs)}</span>
+      )}
+    </>
+  );
+
+  return (
+    <section className={`detail-item ${expanded ? "detail-item-expanded" : ""}`}>
+      {item.isCollapsible ? (
+        <button
+          className="detail-item-toggle"
+          type="button"
+          onClick={() => setExpanded((current) => !current)}
+          aria-expanded={expanded}
+        >
+          {header}
+          <ChevronRight className="detail-item-chevron" size={16} aria-hidden="true" />
+        </button>
+      ) : (
+        <div className="detail-item-toggle detail-item-static">{header}</div>
+      )}
+      <div className="detail-item-content-shell">
+        <div className="detail-item-content">
+          <JsonViewer data={item.data} />
+          <ContextCompressionMemoryBox item={item} />
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -1213,6 +1480,7 @@ function JsonViewer({ data }: { data: Record<string, unknown> }) {
 }
 
 function buildDetailSelection(item: ChatItem, block: ChatMessageBlock): DetailSelection {
+  const isCompleteDetail = block.type === "completion";
   const fallbackData = {
     itemId: item.id,
     taskId: item.taskId,
@@ -1220,15 +1488,44 @@ function buildDetailSelection(item: ChatItem, block: ChatMessageBlock): DetailSe
     createdAt: item.createdAt,
     block,
   };
-  const items = getDetailItems(block, fallbackData);
+  const rawItems = isCompleteDetail
+    ? item.events.map((event) => buildDetailItem(event.type, serverEventToDetailData(event)))
+    : getDetailItems(block, fallbackData);
+  const items = rawItems.map((detailItem) => ({
+    ...detailItem,
+    isCollapsible: isCompleteDetail && rawItems.length > 1,
+  }));
 
   return {
     id: `${item.id}:${block.id}`,
     title: detailTitle(block),
     role: block.type === "text" && block.id.endsWith(":input") ? "user" : "assistant",
     taskId: item.taskId,
-    items,
+    eventGroups: isCompleteDetail
+      ? groupDetailItemsByInterruptionHistory(items)
+      : [{
+        id: `event:${items[0]?.id ?? block.id}`,
+        isHistoryEventForInterruption: false,
+        items,
+      }],
   };
+}
+
+function groupDetailItemsByInterruptionHistory(items: DetailItem[]): DetailEventGroup[] {
+  return items.reduce<DetailEventGroup[]>((groups, item) => {
+    const previousGroup = groups.at(-1);
+    if (!previousGroup || previousGroup.isHistoryEventForInterruption !== item.isHistoryEvent) {
+      groups.push({
+        id: `${item.isHistoryEvent ? "history" : "current"}:${item.id}`,
+        isHistoryEventForInterruption: item.isHistoryEvent,
+        items: [item],
+      });
+      return groups;
+    }
+
+    previousGroup.items.push(item);
+    return groups;
+  }, []);
 }
 
 function getDurationMs(data: Record<string, unknown>): number | undefined {
@@ -1248,13 +1545,15 @@ function getDetailItems(
   const metadata = block.metadata;
   const eventData = getMetadataEvent(metadata);
   if (block.type === "activity_label" && block.source === "tool") {
-    const resultEvent = getMetadataResultEvent(metadata);
-    return [
-      eventData
-        ? buildDetailItem(readString(eventData.type) || "tool_call", eventData)
-        : buildDetailItem("tool_call", fallbackData),
-      ...(resultEvent ? [buildDetailItem("tool_result", resultEvent)] : []),
-    ];
+    if (block.detailEvents?.length) {
+      return block.detailEvents.map((event) => (
+        buildDetailItem(event.type, serverEventToDetailData(event))
+      ));
+    }
+
+    return [eventData
+      ? buildDetailItem(readString(eventData.type) || "tool_call", eventData)
+      : buildDetailItem("tool_call", fallbackData)];
   }
 
   if (eventData) {
@@ -1269,21 +1568,69 @@ function buildDetailItem(title: string, data: Record<string, unknown>): DetailIt
     id: `${eventType || title}:${readString(data.event_id) || eventType || "local"}`,
     title,
     eventType: eventType || undefined,
+    isHistoryEvent: data.is_history_event_for_interruption === true,
+    isCollapsible: false,
+    inputEventType: eventType === "input" ? getInputEventType(data) : undefined,
+    toolName: eventType === "tool_call" || eventType === "tool_result_start"
+      ? getToolName(data)
+      : eventType === "interrupted"
+        ? getInterruptedToolId(data)
+        : undefined,
+    compressionLevel: eventType === "context_compression_final" ? getContextCompressionLevel(data) : undefined,
     status: getDetailStatus(eventType, data),
     durationMs: getDurationMs(data),
     data,
   };
 }
 
+function getInputEventType(data: Record<string, unknown>): string | undefined {
+  const payload = data.data;
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return undefined;
+  }
+
+  return readString((payload as Record<string, unknown>).event_type) || undefined;
+}
+
+function getToolName(data: Record<string, unknown>): string | undefined {
+  const payload = data.data;
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return undefined;
+  }
+
+  return readString((payload as Record<string, unknown>).name) || undefined;
+}
+
+function getInterruptedToolId(data: Record<string, unknown>): string | undefined {
+  const payload = data.data;
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return undefined;
+  }
+
+  const params = (payload as Record<string, unknown>).params;
+  if (params === null || typeof params !== "object" || Array.isArray(params)) {
+    return undefined;
+  }
+
+  return readString((params as Record<string, unknown>).tool_id) || undefined;
+}
+
+function getContextCompressionLevel(data: Record<string, unknown>): number | undefined {
+  const payload = data.data;
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return undefined;
+  }
+
+  const level = (payload as Record<string, unknown>).level;
+  return typeof level === "number" && Number.isInteger(level) && level >= 0 && level <= 2
+    ? level
+    : undefined;
+}
+
 function getDetailStatus(eventType: string, data: Record<string, unknown>): string | undefined {
   if (eventType === "tool_result") {
     return getToolResultStatus(data);
   }
-
-  if (eventType === "context_compression_final") {
-    return getContextCompressionStatus(data);
-  }
-
   return undefined;
 }
 
@@ -1297,21 +1644,6 @@ function getToolResultStatus(data: Record<string, unknown>): string | undefined 
   return status || undefined;
 }
 
-function getContextCompressionStatus(data: Record<string, unknown>): string | undefined {
-  const payload = data.data;
-  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
-    return undefined;
-  }
-
-  const compressionData = payload as Record<string, unknown>;
-  if (compressionData.success === true) {
-    return "success";
-  }
-
-  const error = readString(compressionData.error);
-  return error ? "error" : undefined;
-}
-
 function normalizeDetailStatus(status: string): "success" | "error" {
   return status === "success" ? "success" : "error";
 }
@@ -1323,11 +1655,8 @@ function getMetadataEvent(metadata: Record<string, unknown> | undefined): Record
   return null;
 }
 
-function getMetadataResultEvent(metadata: Record<string, unknown> | undefined): Record<string, unknown> | null {
-  if (metadata?.resultEvent !== null && typeof metadata?.resultEvent === "object" && !Array.isArray(metadata.resultEvent)) {
-    return metadata.resultEvent as Record<string, unknown>;
-  }
-  return null;
+function serverEventToDetailData(event: ServerMessageEvent): Record<string, unknown> {
+  return { ...event };
 }
 
 function readString(value: unknown): string {
@@ -1434,10 +1763,10 @@ function isInterruptedThenRecovered(item: ChatItem, nextItem: ChatItem | undefin
   }
 
   const hasInterruptedEvent = item.events.some(
-    (event) => !event.is_history_event && event.type === "interrupted",
+    (event) => !event.is_history_event_for_interruption && event.type === "interrupted",
   );
   const hasRecoveryInput = nextItem.events.some(
-    (event) => !event.is_history_event
+    (event) => !event.is_history_event_for_interruption
       && event.type === "input"
       && event.data.event_type === "interruption_response",
   );
@@ -1466,7 +1795,7 @@ function buildInterruptionResponse(
     return null;
   }
 
-  if (block.interruptionType === "_os_exception_resume" && action === "retry") {
+  if (block.interruptionType === "exception_resume" && action === "retry") {
     return {
       request_id: block.requestId,
       request_type: block.interruptionType,
@@ -1474,7 +1803,7 @@ function buildInterruptionResponse(
     };
   }
 
-  if (block.interruptionType !== "_os_async_tool_request") {
+  if (block.interruptionType !== "async_tool_request") {
     return null;
   }
 

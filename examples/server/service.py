@@ -49,6 +49,7 @@ from .schemas import (
     ApiCode,
     ApiResponse,
     AppInfoResponse,
+    CompleteData,
     CompletionRequest,
     InputEventData,
     ServerMessageEvent,
@@ -520,7 +521,14 @@ class ServerAppService:
             last_one = records[-1]
             if last_one.event in [SseEventType.STREAM_CHUNK, SseEventType.CHUNK]:
                 event = ServerMessageEvent.model_validate_json(last_one.data)
-                if event.type == ServerMessageEventType.COMPLETE:
+                if (
+                    event.type == ServerMessageEventType.COMPLETE
+                    and ensure_instance(
+                        event.data,
+                        CompleteData,
+                        "complete 事件载荷",
+                    ).is_final_complete
+                ):
                     all_finished = True
                     break
 
@@ -601,8 +609,8 @@ class ServerAppService:
         """
 
         # 创建并初始化 agent runtime
-        runtime = self._build_runtime()
-        await runtime.init_session(session_state, resume=context.page_resume)
+        runtime = self._build_runtime(session_state)
+        await runtime.init_session(resume=context.page_resume)
 
         # 事件处理器
         handler = RuntimeEventHandler(
@@ -633,11 +641,11 @@ class ServerAppService:
             )
 
             # 执行
-            await runtime.run(input_events=input_events)
+            await runtime.run(input_events=input_events, auto_finish=False)
 
             # 保存history
             history_is_empty = len(handler.history_events) <= 0
-            complete_event = handler.history_add_complete_event()
+            complete_event = handler.history_add_complete_event(is_final_complete=True)
             if not history_is_empty:
                 await self._save_history_events(
                     session_id=session_state.session_id,
@@ -646,6 +654,10 @@ class ServerAppService:
                 )
 
             # 收尾注意顺序：
+            # 0、runtime 关闭
+            # runtime 关闭前确保 history 已写入保证结果不丢
+            await runtime.finish()
+
             # 1、发送 completion chunk，标记 chunks 数据结束
             await handler.send_complete(complete_event)
 
@@ -789,8 +801,11 @@ class ServerAppService:
             schema_version=SCHEMA_VERSION,
         )
 
-    def _build_runtime(self) -> Runtime:
+    def _build_runtime(self, session_state: SessionState) -> Runtime:
         """构建一次请求使用的 Runtime。
+
+        参数:
+            session_state: 当前请求绑定的会话状态。
 
         返回:
             已装配示例 Agent 和 MySQL StateStore 的 Runtime。
@@ -798,6 +813,7 @@ class ServerAppService:
 
         return Runtime(
             root_agent=build_agent(self._config),
+            session_state=session_state,
             state_store=self._state_store,
         )
 

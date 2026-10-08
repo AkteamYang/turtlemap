@@ -22,6 +22,7 @@ from turtlemap.kernel.models.models import (
 from turtlemap.os.event_bus import (
     ContextCompressionEvent,
     ContextCompressionMode,
+    AgentFrameChangeEvent,
     InputEvent,
     InterruptedEvent,
     MessageEvent,
@@ -37,11 +38,13 @@ from turtlemap.shared.typing import ensure_instance
 from .schemas import (
     CompleteData,
     ContextCompressionData,
+    AgentFrameChangeEventData,
     InputEventData,
     InterruptedEventData,
     JsonDict,
     MessageDeltaData,
     MessageFinalData,
+    MessagePartialData,
     ServerMessageEvent,
     ServerMessageEventData,
     ServerMessageEventType,
@@ -89,6 +92,18 @@ class RuntimeEventProjector:
                 event=event,
                 run_id=run_id,
             )
+
+        # Agent 控制权栈变更是稳定事实，只投影 FINAL 阶段。
+        if (
+            isinstance(event, AgentFrameChangeEvent)
+            and event.event_phase == RuntimeEventPhase.FINAL
+        ):
+            return [
+                RuntimeEventProjector._build_agent_frame_change_server_event(
+                    event=event,
+                    run_id=run_id,
+                )
+            ]
 
         # tool_call 来自最终 ToolCall 聚合结果，前端据此创建工具标签。
         if isinstance(event, ToolCallEvent) and event.event_phase == RuntimeEventPhase.FINAL:
@@ -150,7 +165,9 @@ class RuntimeEventProjector:
         session_id: str,
         run_id: str,
         task_id: str | None,
+        agent_name: str | None,
         duration_ms: int,
+        is_final_complete: bool,
     ) -> ServerMessageEvent:
         """构建生成完成业务事件。
 
@@ -158,10 +175,12 @@ class RuntimeEventProjector:
             session_id: 当前会话 id。
             run_id: 标识一次完整 agent 运行。
             task_id: 本次生成关联的当前输入任务 id；无稳定 history 时为空。
+            agent_name: 本轮最后一个稳定 history 事件所属 Agent；无稳定 history 时为空。
             duration_ms: 当前 agent 运行到发送 complete 的累计耗时。
+            is_final_complete: 当前 complete 是否标记整个 run 已完成。
 
         返回:
-            前端 complete 事件，data 仅携带耗时。
+            前端 complete 事件，data 携带耗时和 run 最终完成标记。
 
         约束:
             complete 是业务 chunk，用于确认生成结束；外层 SSE end 只表示传输结束。
@@ -172,11 +191,16 @@ class RuntimeEventProjector:
             session_id=session_id,
             run_id=run_id,
             task_id=task_id,
+            agent_name=agent_name,
             event_id=generate_prefixed_id(PREFIX_EVENT_ID),
             parent_event_id=None,
             start_ts_ms=now_ms(),
-            is_history_event=False,
-            data=CompleteData(duration_ms=duration_ms),
+            is_history_event_for_interruption=False,
+            is_replay_event=False,
+            data=CompleteData(
+                duration_ms=duration_ms,
+                is_final_complete=is_final_complete,
+            ),
         )
 
     @staticmethod
@@ -199,6 +223,15 @@ class RuntimeEventProjector:
                 run_id=run_id,
             )
 
+        if (
+            event.event_phase == RuntimeEventPhase.IN_PROGRESS_PARTIAL
+            and event.chunk is not None
+        ):
+            return RuntimeEventProjector._build_message_partial_server_events(
+                event=event,
+                run_id=run_id,
+            )
+
         if event.event_phase == RuntimeEventPhase.FINAL and event.completion is not None:
             if not event.completion.choices:
                 return []
@@ -212,9 +245,17 @@ class RuntimeEventProjector:
                     run_id=run_id,
                     data=MessageFinalData(
                         duration_ms=event.duration_ms,
-                        content=message.content or "",
+                        content=message.content,
                         reasoning_content=message.reasoning_content,
+                        display_content=message.display_content,
+                        display_reasoning_content=message.display_reasoning_content,
+                        context_content=message.context_content,
+                        context_reasoning_content=message.context_reasoning_content,
                         finish_reason=choice.finish_reason,
+                        tool_calls=[
+                            RuntimeEventProjector._build_tool_call_data(tool_call)
+                            for tool_call in message.tool_calls
+                        ],
                         usage=RuntimeEventProjector._dump_usage(event.completion.usage),
                     ),
                 )
@@ -235,22 +276,75 @@ class RuntimeEventProjector:
             文本增量事件列表。
         """
 
-        if event.chunk is None:
+        if event.chunk is None or not event.chunk.choices:
             return []
 
-        server_events: list[ServerMessageEvent] = []
-        for choice in event.chunk.choices:
-            if choice.delta.content is None:
-                continue
-            server_events.append(
-                RuntimeEventProjector._build_server_event(
-                    event_type=ServerMessageEventType.MESSAGE_DELTA,
-                    event=event,
-                    run_id=run_id,
-                    data=MessageDeltaData(delta_content=choice.delta.content),
-                )
+        # 前端当前只展示首个候选，必须与 FINAL 阶段的 choices[0] 保持一致。
+        choice = event.chunk.choices[0]
+        display_content = choice.delta.display_content
+        if display_content is None:
+            display_content = choice.delta.content
+        if display_content is None:
+            return []
+        return [
+            RuntimeEventProjector._build_server_event(
+                event_type=ServerMessageEventType.MESSAGE_DELTA,
+                event=event,
+                run_id=run_id,
+                data=MessageDeltaData(
+                    content=choice.delta.content,
+                    reasoning_content=choice.delta.reasoning_content,
+                    display_content=choice.delta.display_content,
+                    display_reasoning_content=(
+                        choice.delta.display_reasoning_content
+                    ),
+                    context_content=choice.delta.context_content,
+                    context_reasoning_content=(
+                        choice.delta.context_reasoning_content
+                    ),
+                ),
             )
-        return server_events
+        ]
+
+    @staticmethod
+    def _build_message_partial_server_events(
+        event: MessageEvent,
+        run_id: str,
+    ) -> list[ServerMessageEvent]:
+        """投影 MessageEvent 的已展示内容覆盖事件。
+
+        参数:
+            event: 当前 MessageEvent，必须处于 in_progress_partial 阶段。
+            run_id: 当前 agent 运行 id。
+
+        返回:
+            使用完整内容替换前端同一消息块的业务事件列表。
+        """
+
+        if event.chunk is None or not event.chunk.choices:
+            return []
+
+        # 前端当前只展示首个候选，必须与普通增量和 FINAL 阶段保持一致。
+        choice = event.chunk.choices[0]
+        return [
+            RuntimeEventProjector._build_server_event(
+                event_type=ServerMessageEventType.MESSAGE_PARTIAL,
+                event=event,
+                run_id=run_id,
+                data=MessagePartialData(
+                    content=choice.delta.content,
+                    reasoning_content=choice.delta.reasoning_content,
+                    display_content=choice.delta.display_content,
+                    display_reasoning_content=(
+                        choice.delta.display_reasoning_content
+                    ),
+                    context_content=choice.delta.context_content,
+                    context_reasoning_content=(
+                        choice.delta.context_reasoning_content
+                    ),
+                ),
+            )
+        ]
 
     @staticmethod
     def _build_input_server_event(
@@ -285,6 +379,7 @@ class RuntimeEventProjector:
             data=InputEventData(
                 input_id=event.input.input_id,
                 event_type=first_event.event_type,
+                source=first_event.source,
                 user_input=user_input,
                 interruption_response=interruption_response,
                 client_event_id=client_event_id,
@@ -313,6 +408,34 @@ class RuntimeEventProjector:
         )
 
     @staticmethod
+    def _build_agent_frame_change_server_event(
+        event: AgentFrameChangeEvent,
+        run_id: str,
+    ) -> ServerMessageEvent:
+        """构建 Agent 控制权栈变更前端事件。
+
+        参数:
+            event: 当前 FINAL 阶段的 AgentFrameChangeEvent。
+            run_id: 当前 agent 运行 id。
+
+        返回:
+            携带控制权栈变更来源、目标、类型和原因的前端事件。
+        """
+
+        payload = event.payload
+        return RuntimeEventProjector._build_server_event(
+            event_type=ServerMessageEventType.AGENT_FRAME_CHANGE,
+            event=event,
+            run_id=run_id,
+            data=AgentFrameChangeEventData(
+                target=payload.target,
+                source=payload.source,
+                type=payload.type.value,
+                reason=payload.reason.value,
+            ),
+        )
+
+    @staticmethod
     def _build_tool_result_server_event(
         event: ToolResultEvent,
         run_id: str,
@@ -333,9 +456,10 @@ class RuntimeEventProjector:
             run_id=run_id,
             data=ToolResultData(
                 duration_ms=event.duration_ms,
-                tool_call_id=event.tool_call.id or "",
                 status=event.result.status.value,
-                content=event.result.content,
+                tool_call_data=RuntimeEventProjector._build_tool_call_data(
+                    event.tool_call
+                ),
                 raw_data=event.result.model_dump(),
             ),
         )
@@ -449,7 +573,7 @@ class RuntimeEventProjector:
                 request_id=payload.request_id,
                 task_id=payload.task_id,
                 interruption_type=event.interruption_type,
-                reason=payload.reason,
+                reason=payload.assistant_content,
                 params=payload.params,
             ),
         )
@@ -477,10 +601,12 @@ class RuntimeEventProjector:
             session_id=event.session_id,
             run_id=run_id,
             task_id=event.task_id,
+            agent_name=event.agent_display_name,
             event_id=event.event_id,
             parent_event_id=event.parent_event_id,
             start_ts_ms=now_ms(),
-            is_history_event=event.is_history_event,
+            is_history_event_for_interruption=event.is_history_event_for_interruption,
+            is_replay_event=event.is_replay_event,
             data=data,
         )
 
@@ -516,7 +642,19 @@ class RuntimeEventProjector:
 
         if event.source_id:
             return event.source_id
-        raise RuntimeError("缺少 client_event_id")
+
+        if (
+            event.source == EventSource.TOOL
+            and event.event_type == EventType.INTERRUPTION_RESPONSE
+        ) or (
+            event.source == EventSource.HANDOFF
+            and event.event_type == EventType.USER_INPUT
+        ):
+            # 内置恢复工具生成的响应事件没有业务侧幂等键，补齐后回写到事件对象。
+            event.source_id = generate_prefixed_id("client_event_id")
+            return event.source_id
+
+        raise RuntimeError(f"缺少 client_event_id, {event}")
 
     @staticmethod
     def _parse_json_dict(value: str | None) -> JsonDict | None:

@@ -66,8 +66,10 @@ class WeatherQueryInput(BaseModel):
 
 
 @tool(
+    name="query_weight",
     descriptor=ToolDescriptor(
-        name="query_weight",
+        summary="查询指定城市的天气。",
+        capability_category="network",
         capability="查询指定城市的 mock 天气数据。",
         use_cases=[],
         anti_use_cases=[]
@@ -151,13 +153,18 @@ async def main() -> None:
     """
     await init_mysql(mysql_config)
     state_store = MySQLStateStore()
+    session_id: str = "session_id:ce0ed8c3-ef9c-4b32-933b-078731929496"
+    session_state = await state_store.load_session_state(
+        session_id=session_id,
+        schema_version=4,
+    )
     runtime = Runtime(
         root_agent=_build_weather_agent(),
+        session_state=session_state,
         state_store=state_store
     )
     listener_id = EventBus.subscribe(runtime.event_bus_id, print_runtime_event)
-    session_id: str = "session_id:ce0ed8c3-ef9c-4b32-933b-078731929496"
-    session_state = await state_store.load_session_state(session_id=session_id, schema_version=4)
+    await runtime.init_session()
     Logger.logger.info("天气工具 demo 已启动，输入 exit / quit / 退出 可结束。")
     try:
         while True:
@@ -167,7 +174,6 @@ async def main() -> None:
             if user_text.lower() in {"exit", "quit"} or user_text == "退出":
                 break
 
-            await runtime.init_session(session_state)
             # 输入
             event = _build_user_input_event(user_text)
 
@@ -214,6 +220,7 @@ def _build_weather_agent() -> Agent:
     return Agent(
         agent_name="weather_agent",
         system=SystemInstruction(
+            name="天气助手",
             role="你是一个简洁可靠的通用助手。",
             objective=(
                 "理解用户目标并将结果整理成自然、清晰的回答。"

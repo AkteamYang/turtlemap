@@ -42,7 +42,12 @@ from .decorator import ToolCallbackResult
 
 if TYPE_CHECKING:
     from ..agent import BaseAgent
-    from ..models import BaseSessionState, Input, RuntimeArtifact, BaseProcessingTask
+    from ..models import (
+        BaseProcessingTask,
+        BaseSessionState,
+        Input,
+        RuntimeArtifact,
+    )
 
 InputModelT = TypeVar("InputModelT", bound=BaseModel)
 
@@ -235,23 +240,42 @@ class ExecutableTool(Generic[InputModelT]):
 class BaseToolService:
     """表示 Agent 维度工具服务基类。"""
 
-    __slots__ = ("tools",)
+    __slots__ = ("agent_name", "tools", "tool_id2tool")
 
-    def __init__(self, tools: dict[str, ExecutableTool] | None = None) -> None:
+    def __init__(
+        self,
+        agent_name: str,
+        tools: list[ExecutableTool] | None = None,
+    ) -> None:
         """初始化 Agent 维度工具服务。
 
         参数:
-            tools: 当前 Agent 初始可管理的工具映射；键为 `ToolMetadata.id`。
+            agent_name: 当前工具服务所属 Agent 的稳定业务名称。
+            tools: 当前 Agent 初始可管理的工具列表，保持业务声明的插入顺序。
         """
 
-        # 当前 Agent 可管理的全部工具，键为 `tool_metadata.id`。
-        self.tools = dict(tools or {})
+        # 当前工具服务所属 Agent 名称，用于运行期工具筛选、日志与事件关联。
+        self.agent_name = agent_name
+
+        # 当前 Agent 可管理的全部工具，按注册顺序保存，用于稳定投影给模型。
+        self.tools: list[ExecutableTool] = []
+
+        # 工具 id 到工具对象的索引，用于高效查找与重复 id 校验。
+        self.tool_id2tool: dict[str, ExecutableTool] = {}
+
+        for tool in tools or []:
+            self.register_tool(tool)
 
     @classmethod
-    def from_tools(cls, tools: list[ExecutableTool | Callable[..., Any]]) -> "BaseToolService":
+    def from_tools(
+        cls,
+        agent_name: str,
+        tools: list[ExecutableTool | Callable[..., Any]],
+    ) -> "BaseToolService":
         """根据工具列表构建标准 `BaseToolService`。
 
         参数:
+            agent_name: 当前工具服务所属 Agent 的稳定业务名称。
             tools: 业务侧传入的工具列表，允许混合 `ExecutableTool` 实例
                 与已装饰的普通可调用对象。
 
@@ -263,16 +287,11 @@ class BaseToolService:
             建立唯一映射；若出现重复 id，会直接抛出工具配置异常。
         """
 
-        tool_id2tool: dict[str, ExecutableTool] = {}
+        executable_tools: list[ExecutableTool] = []
         for tool in tools:
             executable_tool = cls._normalize_tool(tool)
-            if executable_tool.tool_metadata.id in tool_id2tool:
-                raise KernelToolConfigurationError(
-                    "构建 BaseToolService 时发现重复的工具 id，"
-                    f"tool_id={executable_tool.tool_metadata.id}"
-                )
-            tool_id2tool[executable_tool.tool_metadata.id] = executable_tool
-        return cls(tools=tool_id2tool)
+            executable_tools.append(executable_tool)
+        return cls(agent_name=agent_name, tools=executable_tools)
 
     def list_tools(self) -> list[ExecutableTool]:
         """返回当前 Agent 可管理的全部工具对象。
@@ -281,13 +300,27 @@ class BaseToolService:
             当前工具服务中维护的全部 `ExecutableTool` 列表。
         """
 
-        return list(self.tools.values())
+        return list(self.tools)
 
-    def register_tool(self, tool: ExecutableTool):
-        if tool.tool_metadata.id in self.tools:
-            raise KernelRuntimeError(f"添加tools时 id 重复 {tool.tool_metadata.id}")
+    def register_tool(self, tool: ExecutableTool) -> None:
+        """按注册顺序添加一个可执行工具。
 
-        self.tools[tool.tool_metadata.id] = tool
+        参数:
+            tool: 待加入当前工具服务的标准 ExecutableTool。
+
+        返回:
+            无返回值。
+
+        异常:
+            KernelRuntimeError: 工具 id 已存在时抛出，避免模型工具定义和执行查找不一致。
+        """
+
+        tool_id = tool.tool_metadata.id
+        if tool_id in self.tool_id2tool:
+            raise KernelRuntimeError(f"添加 tools 时 id 重复：tool_id={tool_id}")
+
+        self.tools.append(tool)
+        self.tool_id2tool[tool_id] = tool
 
     async def get_tools_with_inputs(
         self,
@@ -317,15 +350,12 @@ class BaseToolService:
         """根据工具名称查找工具对象。
 
         参数:
-            tool_name: 待查找的工具名称。
+            tool_id: 待查找的工具稳定 id。
 
         返回:
-            名称匹配的 `ExecutableTool` 对象。
-
-        说明:
-            若当前工具服务中不存在对应名称的工具，则抛出工具查找异常。
+            id 匹配的 `ExecutableTool` 对象；不存在时返回 `None`。
         """
-        return self.tools.get(tool_id, None)
+        return self.tool_id2tool.get(tool_id)
 
     async def build_tool_execution_units(
         self,

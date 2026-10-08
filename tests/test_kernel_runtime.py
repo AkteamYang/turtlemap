@@ -29,6 +29,7 @@ from turtlemap.kernel.interfaces import (
 )
 from turtlemap.kernel.models import (
     BaseAgentState,
+    BaseSessionState,
     Message,
     ObservableEvent,
     SystemDefinition,
@@ -220,6 +221,7 @@ def test_runtime_can_finish_plain_message_path():
     )
     runtime = BaseRuntime(
         root_agent=root_agent,
+        session_state=BaseSessionState(),
         services=RuntimeServices(
             model_client_provider=StaticModelClientProvider(client=client),
             context_build_provider=FakeContextBuildProvider(),
@@ -288,6 +290,7 @@ def test_runtime_can_finish_tool_loop_path():
     )
     runtime = BaseRuntime(
         root_agent=root_agent,
+        session_state=BaseSessionState(),
         services=RuntimeServices(
             model_client_provider=StaticModelClientProvider(client=client),
             context_build_provider=FakeContextBuildProvider(),

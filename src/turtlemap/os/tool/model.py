@@ -12,9 +12,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
+
+from turtlemap.kernel.models.enums import RuntimeArtifactType
+from turtlemap.kernel.models.models import BaseAgentFrameChange, RuntimeArtifact
+from turtlemap.kernel.models.polymorphic import BaseStateModel
+from turtlemap.os.llm.model import LLMCompletionToolCall, LLMMessage
 
 if TYPE_CHECKING:
     from turtlemap.os.tool.service import ToolService
@@ -65,3 +71,12 @@ class ToolInputContext:
         """
 
         return getattr(input_model, ATTR_TOOL_INPUT_CONTEXT, None)
+
+class AgentFrameChange(BaseAgentFrameChange):
+    """表示一次 Agent 控制权栈变更的稳定产物。
+
+    说明:
+        `type` 描述控制权栈的 push 或 pop 动作，`reason` 描述触发该动作的
+        业务语义。该产物同时作为任务状态与 event bus 通知的共享载荷。
+    """
+    ...

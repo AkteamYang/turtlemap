@@ -16,8 +16,7 @@ from typing import Any, TypeAlias, Union
 
 from pydantic import Field, SerializeAsAny, ValidationInfo, field_validator
 
-from turtlemap.kernel.exceptions import KernelError, KernelRuntimeError
-from turtlemap.kernel.tool.models import ToolResult
+from turtlemap.kernel.exceptions import KernelRuntimeError
 from turtlemap.shared.ids import PREFIX_TASK_ID, generate_prefixed_id
 
 from .enums import (
@@ -28,8 +27,33 @@ from .enums import (
     RuntimeArtifactType,
     TaskStateKind,
     TaskStatus,
+    AgentFrameChangeType,
+    AgentFrameChangeReason
 )
 from .polymorphic import BaseStateModel, PolymorphicStateModel, ValidateFieldModel
+
+
+class BaseAgentFrameChange(BaseStateModel):
+    """表示一次 Agent 控制权栈变更的稳定产物。
+
+    说明:
+        `type` 描述控制权栈的 push 或 pop 动作，`reason` 描述触发该动作的
+        业务语义。该产物同时作为任务状态与 event bus 通知的共享载荷。
+    """
+
+    # 变更后的目标 Agent 名称。
+    target: str
+
+    # 发起本次控制权栈变更的来源 Agent 名称。
+    source: str
+
+    # 控制权栈变更动作。
+    type: AgentFrameChangeType
+
+    # 控制权栈变更的业务原因。
+    reason: AgentFrameChangeReason
+
+
 from ..tool import ExecutionUnit
 
 
@@ -146,6 +170,9 @@ class RuntimeArtifact(ValidateFieldModel):
     # 当前产物类型，kernel 只根据该字段区分必要流程。
     type: RuntimeArtifactType
 
+    # 当前产物所属 Agent 的名称，用于按 Agent 视角投影会话上下文。
+    owner_agent_name: str = ""
+
     # os 层产物载荷，kernel 不解析其内部结构。
     payload: SerializeAsAny[Any]
 
@@ -177,7 +204,6 @@ class RuntimeArtifact(ValidateFieldModel):
         )
 
 
-
 @RuntimeArtifact.register_field_type(
     "payload", RuntimeArtifactType.INTERRUPTION_REQUEST
 )
@@ -198,8 +224,11 @@ class InterruptionRequest(BaseStateModel):
     # 中断请求类型，可理解为恢复处理函数的稳定名称。
     type: str
 
-    # 面向业务层和上下文构建器的中断原因。
-    reason: str
+    # assistant 消息展示的文本内容。
+    assistant_content: str = Field(default="")
+
+    # 恢复打断提示词，教模型如何恢复任务
+    resume_prompt: str = Field(default="")
 
     # 原本的状态
     origin_task_status: TaskStatus
@@ -244,6 +273,9 @@ class Input(BaseStateModel):
     # 当前输入包的唯一标识。
     input_id: str
 
+    # handoff 输入关联的来源输入包标识；普通输入保持为空。
+    origin_input_id: str = ""
+
     # 当前输入包包含的事件列表。
     events: list[ObservableEvent]
 
@@ -283,18 +315,6 @@ class AgentFrame(BaseStateModel):
 
     # 当前栈帧的来源 Agent 名称。
     from_agent_name: str | None = None
-
-    # 当前 handoff 的唯一标识。
-    handoff_id: str | None = None
-
-    # 当前 handoff 的目标说明。
-    handoff_objective: str | None = None
-
-    # 当前 handoff 完成后回调用的工具名称。
-    completion_tool: str | None = None
-
-    # 当前 handoff 返回时要恢复的任务标识。
-    return_task_id: str | None = None
 
 
 class MemoryView(BaseStateModel):
@@ -357,10 +377,6 @@ class MessageState(BaseTaskState):
     # 触发该 message 的输入 id。
     origin_input_id: str | None = None
 
-    # 当tool_call生成失败时，会进入重新生成阶段，此时强制关闭tools生成
-    no_tool_call: bool = False
-
-
 @BaseTaskState.register_type
 class ToolState(BaseTaskState):
     """表示工具循环任务状态。"""
@@ -397,23 +413,6 @@ class ToolState(BaseTaskState):
                 for item in value
             ]
         return value
-
-
-@BaseTaskState.register_type
-class HandoffState(BaseTaskState):
-    """表示 handoff 等待状态。"""
-
-    # 当前任务状态固定为 handoff 等待任务。
-    type_name: str = Field(default=TaskStateKind.HANDOFF)
-
-    # 当前 handoff 的唯一标识。
-    handoff_id: str = ""
-
-    # 当前 handoff 的目标 Agent 名称。
-    target_agent_name: str = ""
-
-    # 当前 handoff 的目标说明。
-    objective: str = ""
 
 
 @BaseTaskState.register_type
@@ -457,6 +456,9 @@ class BaseProcessingTask(PolymorphicStateModel):
     # 当前任务挂载的中断请求；一次暂停只对应一个请求，具体请求内容由业务层表达。
     interruption_request: InterruptionRequest | None = None
 
+    # 任务完成后需要执行的 Agent 控制权栈变更；为空表示保持当前控制权。
+    agent_frame_change: BaseAgentFrameChange | None = None
+
     @field_validator("state", mode="before")
     @classmethod
     def _validate_state(cls, value: object) -> object:
@@ -497,15 +499,9 @@ class BaseAgentState(PolymorphicStateModel):
     # 当前 Agent 的系统定义快照。
     system: SerializeAsAny[SystemDefinition]
 
-    # 当前 Agent 可见的历史产物本体，用于运行期上下文构建。
-    history: list[RuntimeArtifact] = Field(default_factory=list)
-
     # 当前 Agent 尚未完成的任务列表。
     # 待用户确认，但是却切换到其他话题
     processing_tasks: list[SerializeAsAny[BaseProcessingTask]] = Field(default_factory=list)
-
-    # 当前轮上下文记忆视图，承接长期记忆与中期工作记忆。
-    memory: MemoryView = Field(default_factory=MemoryView)
 
     @field_validator("system", mode="before")
     @classmethod
@@ -558,7 +554,8 @@ class BaseSessionState(BaseStateModel):
     说明:
         该模型只承接 runtime 闭环恢复所需的最小字段，不直接吸收明显偏业务层、
         回放层或产品层的会话扩展参数。若 os 层需要额外会话语义，应优先通过
-        派生模型扩展，而不是持续膨胀 kernel 基础模型。
+        派生模型扩展，而不是持续膨胀 kernel 基础模型。历史产物与记忆视图
+        归属于会话。
     """
 
     # 当前会话的 Agent 控制权栈。
@@ -566,6 +563,12 @@ class BaseSessionState(BaseStateModel):
 
     # 尚未被 Runtime 接管处理的输入队列。
     input_queue: list[Input] = Field(default_factory=list)
+
+    # 当前会话按时间顺序保存的稳定 Runtime 产物，用于所有 Agent 的上下文投影。
+    history: list[RuntimeArtifact] = Field(default_factory=list)
+
+    # 当前会话的记忆视图，承接长期记忆运行视图与中期会话摘要。
+    memory: MemoryView = Field(default_factory=MemoryView)
 
     # 当前会话已加载的 BaseAgentState 映射，作为 Runtime 恢复所需完整现场随 SessionState 保存。
     agent_name2agent_state: dict[str, SerializeAsAny[BaseAgentState]] = Field(default_factory=dict)
@@ -600,6 +603,15 @@ class BaseSessionState(BaseStateModel):
         
         state = self.agent_name2agent_state[frame.agent_name]
         return state
+
+    def clean_state(self):
+        self.input_queue = []
+        top_agent_state = self.top_agent_state()
+        top_agent_state.processing_tasks = [
+            task
+            for task in top_agent_state.processing_tasks
+            if not task.state.is_running
+        ]
 
 
 # BaseAgentState 本身也作为可恢复类型注册，兼容只使用 kernel 基类的状态快照。

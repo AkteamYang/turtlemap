@@ -188,17 +188,29 @@ class RuntimeEventHandler:
             event=event,
             run_id=self._run_id,
         )
-        self._history_events.extend(self._filter_history_events(projected_events))
         for projected_event in projected_events:
-            record = SseRecord(
-                sse_id="",
-                event=SseEventType.CHUNK,
-                data=projected_event.model_dump_json(),
-            )
-            await self._emit(record)
+            history_events = self._filter_history_events([projected_event])
 
-    def history_add_complete_event(self) -> ServerMessageEvent:
+            # 仅以稳定 history 事件作为任务轮次边界，避免流式 delta 重复结束上一轮。
+            if (
+                history_events
+                and self._history_events
+                and projected_event.task_id != self._get_latest_history_task_id()
+            ):
+                complete_event = self.history_add_complete_event(is_final_complete=False)
+                await self._send_server_message_event(complete_event)
+
+                # 新任务从自身首个稳定事件起单独统计 complete 耗时。
+                self._start = time.perf_counter()
+
+            self._history_events.extend(history_events)
+            await self._send_server_message_event(projected_event)
+
+    def history_add_complete_event(self, is_final_complete: bool) -> ServerMessageEvent:
         """创建并记录本轮 complete 业务事件。
+
+        参数:
+            is_final_complete: 当前 complete 是否标记整个 run 已完成。
 
         返回:
             本轮 complete 前端事件。
@@ -212,7 +224,13 @@ class RuntimeEventHandler:
             session_id=self._session_id,
             run_id=self._run_id,
             task_id=self._get_latest_history_task_id(),
+            agent_name=(
+                self._history_events[-1].agent_name
+                if self._history_events
+                else None
+            ),
             duration_ms=self._calculate_duration_ms(),
+            is_final_complete=is_final_complete,
         )
         self._history_events.extend(self._filter_history_events([complete_event]))
         return complete_event
@@ -229,12 +247,33 @@ class RuntimeEventHandler:
         """
 
         await self._stop_heartbeat()
-        complete_record = SseRecord(
+        await self._send_server_message_event(complete_event, is_finish=True)
+
+    async def _send_server_message_event(
+        self,
+        event: ServerMessageEvent,
+        is_finish: bool = False,
+    ) -> None:
+        """将业务事件写入 Redis Stream 并发送到当前 SSE 响应。
+
+        参数:
+            event: 当前待发送的业务事件。
+            is_finish: 是否作为整个 run 的 Redis Stream 完成标记。
+
+        返回:
+            无返回值。
+
+        约束:
+            中间轮次的 complete 仅作为普通 chunk 发送，只有最终 complete 才传入
+            `True`，从而关闭 Redis Stream 的续接等待。
+        """
+
+        record = SseRecord(
             sse_id="",
             event=SseEventType.CHUNK,
-            data=complete_event.model_dump_json(),
+            data=event.model_dump_json(),
         )
-        await self._emit(complete_record, is_finish=True)
+        await self._emit(record, is_finish=is_finish)
 
     async def _send_heartbeat(self) -> None:
         """发送并缓存一次 heartbeat。
@@ -290,10 +329,10 @@ class RuntimeEventHandler:
         return sequence
 
     def _calculate_duration_ms(self) -> int:
-        """计算当前 handler 从创建到当前时刻的耗时。
+        """计算当前会话轮次从开始到当前时刻的耗时。
 
         返回:
-            当前 handler 生命周期累计耗时，单位毫秒。
+            当前会话轮次累计耗时，单位毫秒。
         """
 
         return max(0, int((time.perf_counter() - self._start) * 1000))
@@ -329,10 +368,12 @@ class RuntimeEventHandler:
                 ServerMessageEventType.INPUT,
                 ServerMessageEventType.MESSAGE_FINAL,
                 ServerMessageEventType.TOOL_CALL,
+                ServerMessageEventType.TOOL_RESULT_START,
                 ServerMessageEventType.TOOL_RESULT,
                 ServerMessageEventType.CONTEXT_COMPRESSION_FINAL,
                 ServerMessageEventType.INTERRUPTED,
                 ServerMessageEventType.COMPLETE,
+                ServerMessageEventType.AGENT_FRAME_CHANGE,
             }
         ]
 

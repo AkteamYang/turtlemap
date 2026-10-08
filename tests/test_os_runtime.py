@@ -199,6 +199,7 @@ def test_runtime_constructor_uses_mysql_store(monkeypatch) -> None:
 
     runtime = Runtime(
         root_agent=_build_test_agent(),
+        session_state=SessionState(),
     )
 
     assert isinstance(runtime.services.state_store, _FakeMySQLStateStore)
@@ -219,6 +220,7 @@ def test_runtime_del_closes_event_bus(monkeypatch) -> None:
 
     runtime = Runtime(
         root_agent=_build_test_agent(),
+        session_state=SessionState(),
     )
 
     runtime.__del__()
@@ -271,6 +273,7 @@ def test_runtime_run_returns_runtime_run_result(monkeypatch) -> None:
 
     runtime = Runtime(
         root_agent=_build_test_agent(),
+        session_state=SessionState(),
     )
 
     result = asyncio.run(

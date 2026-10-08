@@ -28,10 +28,12 @@ from ..models import (
     ToolResultStatus,
 )
 from ..models import BaseStateModel, PolymorphicStateModel
+from ..models.models import BaseAgentFrameChange
 
 if TYPE_CHECKING:
-    from ..agent import BaseAgent
     from ..models import BaseAgentState, BaseSessionState, BaseProcessingTask
+    from ..agent import BaseAgent
+
 
 JsonDict = dict[str, Any]
 # kernel 内建保留的执行单元类型名。
@@ -41,6 +43,13 @@ RESERVED_UNIT_TYPE_LLM_CALL = "llm_call"
 DECORATED_TOOL_METADATA_ATTR = "__tool_metadata__"
 DECORATED_TOOL_DESCRIPTOR_ATTR = "__tool_descriptor__"
 DECORATED_TOOL_INPUT_MODEL_ATTR = "__tool_input_model__"
+
+K_RAW_DATA_EVENT = "_raw_data_event"
+K_RAW_DATA_HANDOFF = "_raw_data_handoff"
+
+
+# handoff 转换为工具时使用的稳定工具 id 前缀。
+K_HANDOFF_TOOL_ID_PREFIX = "_handoff_"
 
 
 class ToolFactSourceType(str, Enum):
@@ -89,9 +98,6 @@ class ToolCall(BaseStateModel):
 class ToolDescriptor(BaseStateModel):
     """表示创建侧的结构化工具描述。"""
 
-    # 工具名称。
-    name: str
-
     # 工具能力说明，描述该工具能提供什么确定性能力。
     capability: str
 
@@ -104,8 +110,21 @@ class ToolDescriptor(BaseStateModel):
     # 帮助模型理解调用方式的示例文本列表。
     examples: list[str] = Field(default_factory=list)
 
-    # 供上层系统使用的标签。
-    tags: list[str] = Field(default_factory=list)
+    # 用于 Planner 快速判断工具用途的简短能力描述。
+    summary: str = ""
+
+    # 工具所属的稳定能力目录，例如 disk、network 或 database。
+    capability_category: str = ""
+
+
+class AgentDescriptor(ToolDescriptor):
+    """表示 Agent 被委派时对模型暴露的工具描述。
+
+    说明:
+        AgentDescriptor 复用 ToolDescriptor 的能力、使用边界、示例和标签，
+        仅通过类型区分它属于 Agent 委派入口。工具名称始终由 Agent 的
+        `agent_name` 自动生成，不在描述对象中重复保存。
+    """
 
 
 class ToolMetadata(BaseStateModel):
@@ -171,6 +190,16 @@ class ToolMetadata(BaseStateModel):
             requires_confirmation=requires_confirmation,
         )
 
+    @property
+    def is_handoff(self) -> bool:
+        """判断当前工具是否由 Agent handoff 转换而来。
+
+        返回:
+            工具 id 使用 handoff 稳定前缀时返回 `True`，否则返回 `False`。
+        """
+
+        return self.id.startswith(K_HANDOFF_TOOL_ID_PREFIX)
+
 
 class EmptyToolInputModel(BaseModel):
     """表示无需参数的工具输入模型。
@@ -208,10 +237,8 @@ class ToolResult(BaseStateModel):
     # 数据用途说明。
     purpose: str = ""
 
-    # 当前工具事实的过期时间；默认 5 分钟后过期，避免外部实时数据被长期复用。
-    expires_at: datetime | None = Field(
-        default_factory=lambda: datetime.now(timezone.utc) + timedelta(minutes=5)
-    )
+    # 当前工具事实的过期时间；默认不过期。
+    expires_at: datetime | None = None
 
     # 程序侧透传的原始结构化数据。
     raw_data: JsonDict | None = None
@@ -261,6 +288,9 @@ class ExecutionUnitResult(PolymorphicStateModel):
 
     # 当前结果要求追加到执行链末尾的新执行单元列表。
     appended_execution_units: list["ExecutionUnit"] = Field(default_factory=list)
+
+    # handoff
+    handoff: BaseAgentFrameChange | None = None
 
     # 当前结果要求 Runtime 执行的任务级切换动作。
     task_switch_action: TaskSwitchAction | None = None
@@ -390,6 +420,9 @@ class ToolExecutionContext:
 
     # 当前执行单元所属的 Agent。
     agent: BaseAgent
+
+    # 当前会话中可达 Agent 的稳定名称到运行时对象映射。
+    agent_name2agent: dict[str, BaseAgent]
 
     # 当前 Owner Agent 对应状态。
     owner_state: BaseAgentState

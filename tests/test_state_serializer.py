@@ -103,7 +103,7 @@ def test_state_serializer_round_trips_session_state_with_agent_name2agent_state(
 
 
 def test_state_serializer_round_trips_session_state_with_tool_history() -> None:
-    """验证 AgentState history 会跟随 SessionState 一起保存和恢复。"""
+    """验证会话 history 会跟随 SessionState 一起保存和恢复。"""
 
     tool_call = LLMCompletionToolCall(
         id="tool_call_1",
@@ -115,40 +115,41 @@ def test_state_serializer_round_trips_session_state_with_tool_history() -> None:
     )
     agent_state = AgentState(
         agent_name="root_agent",
-            system=SystemDefinition(
-                role="assistant",
-                objective="help user",
-                constraints="简洁回答",
-            ),
-        history=[
-            RuntimeArtifact(
-                type=RuntimeArtifactType.INPUT,
-                payload=Input(
-                    input_id="input_1",
-                    events=[
-                        ObservableEvent(
-                            event_id="event_1",
-                            event_type=EventType.USER_INPUT,
-                            source=EventSource.USER,
-                            payload=UserInputPayload(content="查一下 turtlemap"),
-                        )
-                    ],
-                ),
-            ),
-            RuntimeArtifact(
-                type=RuntimeArtifactType.TOOL_CALL,
-                payload=LLMMessage(
-                    role=MessageRole.ASSISTANT,
-                    content="我来查",
-                    tool_calls=[tool_call],
-                ),
-            ),
-        ],
+        system=SystemDefinition(
+            role="assistant",
+            objective="help user",
+            constraints="简洁回答",
+        ),
     )
+    history = [
+        RuntimeArtifact(
+            type=RuntimeArtifactType.INPUT,
+            payload=Input(
+                input_id="input_1",
+                events=[
+                    ObservableEvent(
+                        event_id="event_1",
+                        event_type=EventType.USER_INPUT,
+                        source=EventSource.USER,
+                        payload=UserInputPayload(content="查一下 turtlemap"),
+                    )
+                ],
+            ),
+        ),
+        RuntimeArtifact(
+            type=RuntimeArtifactType.TOOL_CALL,
+            payload=LLMMessage(
+                role=MessageRole.ASSISTANT,
+                content="我来查",
+                tool_calls=[tool_call],
+            ),
+        ),
+    ]
 
     session_state = SessionState(
         session_id="session_1",
         agent_name2agent_state={"root_agent": agent_state},
+        history=history,
     )
     record = StateSerializer.build_session_state_record(
         session_state=session_state,
@@ -160,9 +161,9 @@ def test_state_serializer_round_trips_session_state_with_tool_history() -> None:
     assert restored_agent_state.agent_name == "root_agent"
     assert '"history":' in record.state_json
     assert '"agent_name2agent_state":' in record.state_json
-    assert len(restored_agent_state.history) == 2
-    restored_user_input = Input.model_validate(restored_agent_state.history[0].payload)
-    restored_tool_call_message = LLMMessage.model_validate(restored_agent_state.history[1].payload)
+    assert len(restored_session_state.history) == 2
+    restored_user_input = Input.model_validate(restored_session_state.history[0].payload)
+    restored_tool_call_message = LLMMessage.model_validate(restored_session_state.history[1].payload)
     restored_user_payload = UserInputPayload.model_validate(
         restored_user_input.events[0].payload
     )

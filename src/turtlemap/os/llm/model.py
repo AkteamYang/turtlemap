@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import json
-from typing import Generic, Literal, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, Field, TypeAdapter
 
@@ -29,8 +29,9 @@ class LLMMessage(BaseModel):
 
     说明:
         该模型用于 os 层适配具体 LLM 服务时承载请求消息。纯文本对话使用
-        `role` 与 `content`；工具结果消息通过 `tool_call_id` 关联前置调用；
-        assistant 工具调用消息通过 `tool_calls` 传回模型上下文。
+        `role` 与原始 `content`；工具结果消息通过 `tool_call_id` 关联前置调用；
+        assistant 工具调用消息通过 `tool_calls` 传回模型上下文。运行期拦截器可额外写入
+        `display_*` 与 `context_*` 两条内容通道，分别供用户展示和后续模型调用使用。
     """
 
     # 消息持久化后的自增唯一标识；未落库前允许为空。
@@ -45,11 +46,29 @@ class LLMMessage(BaseModel):
     # 当前推理完整内容，用于兼容 reasoning 模型输出。
     reasoning_content: str | None = None
 
+    # 面向用户展示的正文；为空时展示层回退使用原始 content。
+    display_content: str | None = None
+
+    # 面向用户展示的推理内容；为空时展示层回退使用原始 reasoning_content。
+    display_reasoning_content: str | None = None
+
+    # 面向后续 LLM 上下文的正文；为空时 LLM client 回退使用原始 content。
+    context_content: str | None = None
+
+    # 面向后续 LLM 上下文的推理内容；为空时回退使用原始 reasoning_content。
+    context_reasoning_content: str | None = None
+
+    # Runtime 在消息生成与拦截期间附加的结构化控制参数，不传递给 LLM provider。
+    runtime_params: dict[str, Any] = Field(default_factory=dict)
+
     # 工具结果消息对应的工具调用标识；普通文本消息为空。
     tool_call_id: str | None = None
 
     # assistant 消息中携带的工具调用列表；非工具调用消息为空列表。
     tool_calls: list[LLMCompletionToolCall] = Field(default_factory=list)
+
+    # 可用的funcion name（tool_metadata.id）
+    available_funtion_names: list[str] = Field(default_factory=list)
 
     def to_token_budget_text(self) -> str:
         """生成用于估算上下文 token 预算的代表性字符串。
@@ -68,8 +87,11 @@ class LLMMessage(BaseModel):
             return self._build_tool_result_token_budget_text()
 
         parts: list[str] = []
-        if self.content:
-            parts.append(self.content)
+        context_content = self.context_content
+        if context_content is None:
+            context_content = self.content
+        if context_content:
+            parts.append(context_content)
         if self.tool_calls:
             parts.append(self._build_tool_calls_token_budget_text())
         return "\n".join(parts)
@@ -81,10 +103,13 @@ class LLMMessage(BaseModel):
             包含工具调用 id 和工具结果文本的紧凑 JSON 字符串。
         """
 
+        context_content = self.context_content
+        if context_content is None:
+            context_content = self.content
         return json.dumps(
             {
                 "tool_call_id": self.tool_call_id,
-                "content": self.content or "",
+                "content": context_content or "",
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -153,7 +178,9 @@ class LLMCompletionChunkChoiceDelta(BaseModel):
 
     说明:
         该模型参考 OpenAI `ChoiceDelta`，并补充 `reasoning_content` 字段，
-        用于兼容支持推理内容流式输出的模型。
+        用于兼容支持推理内容流式输出的模型。`content` 与 `reasoning_content` 始终保留
+        provider 原始增量；`display_*` 和 `context_*` 由运行期拦截器分别表达展示与
+        历史回填结果，不改写原始输出。
     """
 
     # 当前片段所属角色，通常只在首个片段中返回。
@@ -164,6 +191,21 @@ class LLMCompletionChunkChoiceDelta(BaseModel):
 
     # 当前推理内容片段，用于兼容 reasoning 模型输出。
     reasoning_content: str | None = None
+
+    # 当前面向用户展示的正文片段。
+    display_content: str | None = None
+
+    # 当前面向用户展示的推理内容片段。
+    display_reasoning_content: str | None = None
+
+    # 当前面向后续 LLM 上下文的正文片段。
+    context_content: str | None = None
+
+    # 当前面向后续 LLM 上下文的推理内容片段。
+    context_reasoning_content: str | None = None
+
+    # Runtime 在流式处理期间附加的结构化控制参数。
+    runtime_params: dict[str, Any] = Field(default_factory=dict)
 
     # 当前片段携带的工具调用增量列表。
     tool_calls: list[LLMDeltaToolCall] | None = None
@@ -185,7 +227,6 @@ class LLMCompletionChunkChoice(BaseModel):
 
     # 当前候选回复的结束原因，通常只在最后一个增量片段中出现。
     finish_reason: str | None = None
-
 
 class LLMCompletionChunk(BaseModel):
     """表示一次 LLM 流式响应 chunk。
@@ -236,13 +277,16 @@ class LLMCompletionToolCall(BaseModel):
     """
 
     # 当前工具调用的唯一标识。
-    id: str | None = None
+    id: str
 
     # 当前工具调用携带的完整函数调用信息。
-    function: LLMFunction | None = None
+    function: LLMFunction
 
     # 工具调用类型，当前仅支持 function。
     type: Literal["function"] | None = None
+
+    # Runtime 生成的详细错误信息
+    runtime_error_msg: str = ""
 
 
 _LLM_COMPLETION_TOOL_CALLS_ADAPTER = TypeAdapter(list[LLMCompletionToolCall])
@@ -267,7 +311,6 @@ class LLMCompletionChoice(BaseModel, Generic[StructuredOutputT]):
 
     # 当前候选回复的结束原因。
     finish_reason: str | None = None
-
 
 class LLMCompletionUsage(BaseModel):
     """表示一次 LLM completion 的 token 用量。

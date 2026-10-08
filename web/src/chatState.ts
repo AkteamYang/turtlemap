@@ -12,6 +12,7 @@ import type {
 
 export type ChatItemPresentation = {
   inputBlock: TextBlock | null;
+  agentName: string | null;
   historyBlocks: ChatMessageBlock[];
   currentBlocks: ChatMessageBlock[];
 };
@@ -51,6 +52,14 @@ export function createChatItem(options: {
   };
 }
 
+/** 获取任务当前非历史输入事件声明的回答 Agent 名称。 */
+export function getChatItemAgentName(item: ChatItem): string | null {
+  const inputEvent = item.events.find(
+    (event) => !event.is_history_event_for_interruption && event.type === "input",
+  );
+  return stringValue(inputEvent?.agent_name) || null;
+}
+
 /** 根据 SSE 事件追加或更新任务项，并同步同任务的中断恢复状态。 */
 export function applyServerEvent(items: ChatItem[], event: ServerMessageEvent): ChatItem[] {
   const itemIndex = findTargetItemIndex(items, event);
@@ -86,20 +95,16 @@ export function markStreamingItemsError(items: ChatItem[], errorText: string, er
   } : item);
 }
 
-/** 运行中的任务需要每秒触发一次重渲染，以刷新完成耗时。 */
-export function refreshLiveCompletionDurations(items: ChatItem[]): ChatItem[] {
-  return items.some((item) => item.status === "streaming") ? [...items] : items;
-}
-
 /** 从一个任务项的原始事件推导用户输入、折叠历史和当前输出。 */
-export function buildChatItemPresentation(item: ChatItem, now = Date.now()): ChatItemPresentation {
-  const historyEvents = item.events.filter((event) => event.is_history_event);
-  const currentEvents = item.events.filter((event) => !event.is_history_event);
+export function buildChatItemPresentation(item: ChatItem, now: number): ChatItemPresentation {
+  const historyEvents = item.events.filter((event) => event.is_history_event_for_interruption);
+  const currentEvents = item.events.filter((event) => !event.is_history_event_for_interruption);
   const inputEvent = currentEvents.find((event) => event.type === "input") ?? null;
   return {
     inputBlock: inputEvent
-      ? (isInterruptionResponseInput(inputEvent) ? null : inputEventToBlock(inputEvent))
+      ? (isHiddenCurrentInput(inputEvent) ? null : inputEventToBlock(inputEvent))
       : optimisticInputToBlock(item),
+    agentName: getChatItemAgentName(item),
     historyBlocks: [
       ...historyEvents
         .filter((event) => event.type === "input" && event.data.event_type === "user_input")
@@ -148,7 +153,7 @@ function findTargetItemIndex(items: ChatItem[], event: ServerMessageEvent): numb
 }
 
 function isTerminalEvent(event: ServerMessageEvent): boolean {
-  return event.type === "complete" || (event.type === "interrupted" && !event.is_history_event);
+  return event.type === "complete" || (event.type === "interrupted" && !event.is_history_event_for_interruption);
 }
 
 function isEmptyCompletion(event: ServerMessageEvent, item: ChatItem | null): boolean {
@@ -203,7 +208,9 @@ function eventsToBlocks(events: ServerMessageEvent[], item: ChatItem, isCurrent:
 }
 
 function applyEventToBlocks(blocks: ChatMessageBlock[], event: ServerMessageEvent): ChatMessageBlock[] {
+  if (isHandoffToolEvent(event)) return blocks;
   if (event.type === "message_delta") return appendDelta(blocks, event);
+  if (event.type === "message_partial") return applyMessageFinal(blocks, event);
   if (event.type === "message_final") return applyMessageFinal(blocks, event);
   if (event.type === "tool_call") return addToolLabel(blocks, event);
   if (event.type === "tool_result_start") return startToolLabel(blocks, event);
@@ -238,14 +245,22 @@ function optimisticInputToBlock(item: ChatItem): TextBlock | null {
 
 function appendDelta(blocks: ChatMessageBlock[], event: ServerMessageEvent): ChatMessageBlock[] {
   const id = messageBlockId(event);
-  const content = stringValue(event.data.delta_content);
+  const content = stringValue(event.data.display_content ?? event.data.content);
   const index = blocks.findIndex((block) => block.type === "text" && block.id === id);
   if (index === -1) return [...blocks, { type: "text", id, content, metadata: buildEventMetadata(event) }];
   return blocks.map((block, blockIndex) => blockIndex === index && block.type === "text" ? { ...block, content: `${block.content}${content}`, metadata: buildEventMetadata(event) } : block);
 }
 
 function applyMessageFinal(blocks: ChatMessageBlock[], event: ServerMessageEvent): ChatMessageBlock[] {
-  const block: TextBlock = { type: "text", id: messageBlockId(event), content: stringValue(event.data.content), reasoningContent: optionalStringValue(event.data.reasoning_content), metadata: buildEventMetadata(event) };
+  const block: TextBlock = {
+    type: "text",
+    id: messageBlockId(event),
+    content: stringValue(event.data.display_content ?? event.data.content),
+    reasoningContent: optionalStringValue(
+      event.data.display_reasoning_content ?? event.data.reasoning_content,
+    ),
+    metadata: buildEventMetadata(event),
+  };
   const index = blocks.findIndex((current) => current.type === "text" && current.id === block.id);
   if (!block.content && !block.reasoningContent) {
     return index === -1 ? blocks : blocks.filter((_, blockIndex) => blockIndex !== index);
@@ -266,12 +281,13 @@ function addToolLabel(blocks: ChatMessageBlock[], event: ServerMessageEvent): Ch
     state: "loading",
     source: "tool",
     sourceId: toolCallId,
+    detailEvents: [event],
     metadata: buildEventMetadata(event),
   });
 }
 
 function completeToolLabel(blocks: ChatMessageBlock[], event: ServerMessageEvent): ChatMessageBlock[] {
-  const toolCallId = stringValue(event.data.tool_call_id);
+  const toolCallId = getToolResultToolCallId(event);
   const matchingIndex = findLastToolLabelIndex(blocks, toolCallId);
   const matchingBlock = matchingIndex === -1 ? null : blocks[matchingIndex] as ActivityLabelBlock;
   const status = optionalStringValue(event.data.status) ?? "done";
@@ -279,15 +295,15 @@ function completeToolLabel(blocks: ChatMessageBlock[], event: ServerMessageEvent
     type: "activity_label",
     id: matchingBlock?.id ?? `${event.event_id}:tool-result`,
     title: matchingBlock?.title ?? "工具结果",
-    subtitle: optionalStringValue(event.data.content) ?? "",
+    subtitle: getToolResultContent(event),
     durationMs: numberValue(event.data.duration_ms),
     icon: status === "success" ? "check" : "alert",
     state: "normal",
     source: "tool",
     sourceId: toolCallId,
+    detailEvents: [...(matchingBlock?.detailEvents ?? []), event],
     metadata: {
       ...matchingBlock?.metadata,
-      resultEvent: event,
     },
   };
   return matchingIndex === -1 ? [...blocks, result] : blocks.map((block, index) => index === matchingIndex ? result : block);
@@ -298,13 +314,7 @@ function startToolLabel(blocks: ChatMessageBlock[], event: ServerMessageEvent): 
   const matchingIndex = findLastToolLabelIndex(blocks, toolCallId);
   const matchingBlock = matchingIndex === -1 ? null : blocks[matchingIndex] as ActivityLabelBlock;
   if (matchingBlock && !matchingBlock.approvalPending) {
-    return blocks.map((block, index) => index === matchingIndex ? {
-      ...matchingBlock,
-      metadata: {
-        ...matchingBlock.metadata,
-        startEvent: event,
-      },
-    } : block);
+    return blocks;
   }
 
   const params = event.data.parameters ?? event.data.parameters_text;
@@ -317,6 +327,7 @@ function startToolLabel(blocks: ChatMessageBlock[], event: ServerMessageEvent): 
     state: "loading",
     source: "tool",
     sourceId: toolCallId,
+    detailEvents: [event],
     metadata: buildEventMetadata(event),
   };
   return [...blocks, block];
@@ -326,10 +337,16 @@ function markApprovalPendingTool(blocks: ChatMessageBlock[], event: ServerMessag
   const sourceToolId = getApprovalSourceToolId(event);
   if (!sourceToolId) return blocks;
 
-  return blocks.map((block) => block.type === "activity_label"
-    && block.source === "tool"
-    && block.title === sourceToolId
-    ? {
+  return blocks.map((block) => {
+    if (block.type !== "activity_label" || block.source !== "tool") {
+      return block;
+    }
+
+    if (block.title !== sourceToolId) {
+      return block.state === "loading" ? { ...block, state: "normal" } : block;
+    }
+
+    return {
       ...block,
       state: "normal",
       approvalPending: true,
@@ -337,8 +354,8 @@ function markApprovalPendingTool(blocks: ChatMessageBlock[], event: ServerMessag
         ...block.metadata,
         interruptionEvent: event,
       },
-    }
-    : block);
+    };
+  });
 }
 
 function getApprovalSourceToolId(event: ServerMessageEvent): string {
@@ -415,18 +432,23 @@ function compressionFinalSubtitle(event: ServerMessageEvent, merged: boolean, le
 }
 
 function interruptionTitle(event: ServerMessageEvent): string {
-  if (event.data.interruption_type === "_os_exception_resume") return "任务因运行异常暂停，是否需要重试？";
-  if (isAsyncHitlInterruption(event)) return "请确认是否继续执行该操作?";
+  if (event.data.interruption_type === "exception_resume") return "任务因运行异常暂停，是否需要重试？";
+  if (isAsyncHitlInterruption(event)) {
+    const sourceToolId = getApprovalSourceToolId(event);
+    return sourceToolId
+      ? `请确认是否继续执行工具 ${sourceToolId}？`
+      : "请确认是否继续执行该操作？";
+  }
   return "任务正在等待外部工具返回结果，收到结果后将继续处理。";
 }
 
 function interruptionActions(event: ServerMessageEvent): InterruptedBlock["actions"] {
-  if (event.data.interruption_type === "_os_exception_resume") return ["retry"];
+  if (event.data.interruption_type === "exception_resume") return ["retry"];
   return isAsyncHitlInterruption(event) ? ["approve", "reject"] : [];
 }
 
 function isAsyncHitlInterruption(event: ServerMessageEvent): boolean {
-  return event.data.interruption_type === "_os_async_tool_request" && objectValue(event.data.params)?.type === "async_hitl";
+  return event.data.interruption_type === "async_tool_request" && objectValue(event.data.params)?.type === "async_hitl";
 }
 
 function interruptionResponseOptions(event: ServerMessageEvent): string[] {
@@ -445,6 +467,34 @@ function interruptionResponseText(event: ServerMessageEvent): string {
 
 function isInterruptionResponseInput(event: ServerMessageEvent): boolean {
   return event.type === "input" && event.data.event_type === "interruption_response";
+}
+
+function isHiddenCurrentInput(event: ServerMessageEvent): boolean {
+  return isInterruptionResponseInput(event) || isHandoffInput(event);
+}
+
+function isHandoffInput(event: ServerMessageEvent): boolean {
+  return event.type === "input" && event.data.source === "handoff";
+}
+
+function isHandoffToolEvent(event: ServerMessageEvent): boolean {
+  if (event.type === "tool_call" || event.type === "tool_result_start") {
+    return stringValue(event.data.name).startsWith("_handoff");
+  }
+
+  if (event.type === "tool_result") {
+    return stringValue(objectValue(event.data.tool_call_data)?.name).startsWith("_handoff");
+  }
+
+  return false;
+}
+
+function getToolResultContent(event: ServerMessageEvent): string {
+  return optionalStringValue(objectValue(event.data.raw_data)?.content) ?? "";
+}
+
+function getToolResultToolCallId(event: ServerMessageEvent): string {
+  return stringValue(objectValue(event.data.tool_call_data)?.id);
 }
 
 function messageBlockId(event: ServerMessageEvent): string { return `${event.event_id}:message`; }

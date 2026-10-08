@@ -109,22 +109,19 @@ class InMemoryStateStore(StateStoreProtocol):
         snapshot = deepcopy(os_session_state)
         self.session_id2state[os_session_state.session_id] = snapshot
 
-    async def load_agent_long_term_memory(
+    async def load_session_long_term_memory(
         self,
         session_state: BaseSessionState,
-        agent_name: str,
     ) -> str:
-        """加载当前 Agent 生效的长期记忆文本。
+        """加载当前会话生效的长期记忆文本。
 
         参数:
             session_state: 当前会话状态；当前实现不再从会话状态读取用户维度。
-            agent_name: 当前需要加载长期记忆的 Agent 名称。
-
         返回:
             当前长期记忆身份模型未接入，固定返回空字符串。
         """
 
-        _ = (session_state, agent_name)
+        _ = session_state
 
         # SessionState 不再携带 uid，长期记忆身份维度后续单独接入。
         return ""
@@ -224,12 +221,9 @@ class InMemoryStateStore(StateStoreProtocol):
 
         # 从最新快照复制后再合并，避免在乐观锁保存前污染已保存状态。
         latest_session_state = deepcopy(stored_session_state)
-        owner_state = latest_session_state.agent_name2agent_state.get(agent_name)
-        if owner_state is None:
-            return
 
         compression_result.merged = ContextCompressionProvider.merge_compacted_result(
-            owner_agent_state=owner_state,
+            session_state=latest_session_state,
             compression_result=compression_result,
         )
         if not compression_result.merged:

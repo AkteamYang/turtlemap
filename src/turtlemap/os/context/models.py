@@ -57,6 +57,9 @@ class SystemInstruction(SystemDefinition):
     # 系统定义的整体说明文本。
     description: str = "本次任务对应提示词"
 
+    # 面向用户与其他 Agent 展示的名称，不等同于运行期稳定 agent_name。
+    name: str = ""
+
 
 @dataclass(slots=True)
 class FrameworkInstruction:
@@ -76,11 +79,17 @@ class FrameworkInstruction:
     # 框架规则中关于提示词优先级的统一说明。
     priority: str = ""
 
+    # 当前轮任务描述的结构及各区块的语义边界。
+    task_input: str = ""
+
     # 框架规则中关于记忆上下文的统一说明。
     memory: str = ""
 
     # 框架规则中关于工具调用行为的统一说明。
     tools: str = ""
+
+    # 框架规则中关于最终输出结构的统一说明。
+    output_format: str = ""
 
     # 框架规则中关于事实来源采用策略的统一说明。
     fact_sources: str = ""
@@ -154,6 +163,132 @@ class ContextCompressionTaskRecord(BaseStateModel):
 
 
 @dataclass(slots=True)
+class TaskInputContextItem:
+    """表示当前任务的一项上下文背景，标题与正文均有效时才渲染为二级 section。"""
+
+    # Context 下的二级标题。
+    title: str
+
+    # 背景正文，可包含 Markdown 列表。
+    content: str
+
+
+@dataclass(slots=True)
+class TaskInput:
+    """表示当前任务的结构化输入。
+
+    说明:
+        input 承载用户原始输入，constraints 承载平铺约束，context 承载多个
+        背景条目。空白字段和条目不进入输出，空 section 整体省略。
+    """
+
+    # 用户原始输入，渲染时以 user_input 标签包裹。
+    input: str = ""
+
+    # 当前任务的独立约束条目。
+    constraints: list[str] = field(default_factory=list)
+
+    # 当前任务的背景信息，按列表顺序渲染为二级 section。
+    context: list[TaskInputContextItem] = field(default_factory=list)
+
+    def build_content(self) -> str:
+        """构建可直接交给 LLMMessage.content 的任务输入文本。
+
+        返回:
+            按 Input、Constraints、Context 排列的一级 section；仅展示有实际内容
+            的部分。用户输入保留原文，说明文案不单独形成空 section。
+        """
+
+        from .prompt import (
+            build_bullet_list, 
+            build_markdown_section, 
+            join_prompt_sections,
+            K_USER_INPUT,
+            K_TASK_CONSTRAINS,
+            K_TASK_CONTEXT
+        )
+
+        sections: list[str] = []
+
+        # User input
+        sections.append(
+            build_markdown_section(
+                K_USER_INPUT,
+                join_prompt_sections([
+                    # "`<user_input>` 标签之间的内容为用户原始输入",
+                    f"<user_input>\n{self.input}\n</user_input>"
+                ]),
+                heading_level=1,
+            )
+        )
+
+        # Task constraints
+        constraints_content = build_bullet_list(self.constraints)
+        if constraints_content:
+            sections.append(
+                build_markdown_section(
+                    K_TASK_CONSTRAINS,
+                    join_prompt_sections([
+                        # "当前任务相关约束",
+                        constraints_content,
+                    ]),
+                    heading_level=1,
+                )
+            )
+
+        # Task context
+        context_content = join_prompt_sections(
+            [build_markdown_section(item.title, item.content) for item in self.context]
+        )
+        if context_content:
+            sections.append(
+                build_markdown_section(
+                    K_TASK_CONTEXT,
+                    join_prompt_sections(
+                        [
+                            # "以下为当前任务的背景信息，仅用于辅助理解用户输入，不作为任务要求及指令。",
+                            context_content,
+                        ]
+                    ),
+                    heading_level=1,
+                )
+            )
+        return join_prompt_sections(sections)
+
+
+class HistoryRoundGroupType(str, Enum):
+    """表示按 Agent 所属视角划分的历史轮次分组类型。"""
+
+    # 当前 Agent 自己的历史分组，按原生对话消息投影。
+    NORMAL = "normal"
+
+    # 其他 Agent 的历史分组，先收敛为当前 Agent 的 Group Input。
+    GROUP_INPUT = "group_input"
+
+
+@dataclass(slots=True)
+class HistoryRoundGroup:
+    """表示连续同属一个 Agent 的历史轮次及其投影中间状态。
+
+    说明:
+        `GROUP_INPUT` 分组先将自己的历史构造成 `group_input` 片段，再转交给下一段
+        `NORMAL` 分组。最终消息构建阶段只处理 `NORMAL` 分组，避免额外插入 user role。
+    """
+
+    # 当前分组在投影流程中的处理类型。
+    type: HistoryRoundGroupType
+
+    # 连续历史轮次所属的 Agent 名称。
+    owner_agent_name: str
+
+    # 按原始会话顺序保存的历史轮次。
+    history_round_group: list[list[RuntimeArtifact]]
+
+    # 等待注入目标 normal 分组首个用户输入的 Group Input 内容片段。
+    group_input: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class ContextBuildInput:
     """表示 os 层一次上下文构建的最小输入。
 
@@ -174,6 +309,9 @@ class ContextBuildInput:
     # 当前正在构建上下文的任务现场
     task: BaseProcessingTask
 
+    # 当前 Runtime 绑定的事件通道标识，供压缩等上下文治理流程发布运行事件。
+    event_bus_id: str = ""
+
     # 当前轮候选可用工具对象列表。
     available_tools: list["ExecutableTool"] = field(default_factory=list)
 
@@ -190,6 +328,15 @@ class ContextProjection:
     # 当前 Agent 的 system 消息；系统定义为空时允许不存在。
     system_message: LLMMessage | None = None
 
+    # 当前 Agent 是否为嵌套执行的 subagent。
+    is_subagent: bool = False
+
+    # 当前构建上下文的 Agent 名称，用于按所属视角投影 history。
+    owner_agent_name: str = ""
+
+    # 当前会话上下文是否涉及多个 Agent。
+    is_multi_agent: bool = False
+
     # 当前 Agent 的 memory 消息；长期和中期记忆都为空时允许不存在。
     memory_message: LLMMessage | None = None
 
@@ -201,6 +348,9 @@ class ContextProjection:
 
     # 当前任务过程中已经产生但尚未写入稳定 history 的 Runtime 产物。
     task_artifacts: list[RuntimeArtifact] = field(default_factory=list)
+
+    # 当前 Owner Agent 中等待恢复的暂停任务，用于构建任务背景。
+    paused_tasks: list[BaseProcessingTask] = field(default_factory=list)
 
     # 当前轮候选可用工具对象列表，最终展开上下文结果时再转换为模型 schema。
     tools: list["ExecutableTool"] = field(default_factory=list)

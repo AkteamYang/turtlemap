@@ -11,9 +11,12 @@
 
 from .base import BuildinTool
 from .recollection import RecollectionQuery, RecollectionTool
+from .resume_task import ResumeTaskInput, ResumeTaskTool
 
 __all__ = [
     "BuildinTool",
     "RecollectionQuery",
     "RecollectionTool",
+    "ResumeTaskInput",
+    "ResumeTaskTool",
 ]

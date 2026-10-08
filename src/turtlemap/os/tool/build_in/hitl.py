@@ -8,6 +8,7 @@
 # @File    : hitl.py
 
 from enum import Enum
+import json
 from typing import Any, ClassVar
 from typing_extensions import override
 
@@ -15,7 +16,10 @@ from pydantic import BaseModel, Field
 
 from turtlemap.kernel.models.enums import ToolExecutionStrategy, ToolResultStatus
 from turtlemap.kernel.tool.models import JsonDict, ToolDescriptor, ToolMetadata, ToolResult
+from turtlemap.os.context.prompt import build_bullet_list
 from turtlemap.os.tool.build_in.base import BuildinTool
+from turtlemap.os.tool.build_in.resume_task import K_TOOL_NAME_RESUME_TASK, ResumeTaskTool
+from turtlemap.os.tool.enums import BuiltinToolCapabilityCategory
 from turtlemap.shared.json_parser import dump_to_static_json
 from turtlemap.shared.logger import Logger
 
@@ -70,12 +74,13 @@ class HitlTool(BuildinTool[HitlInputModel]):
         """
 
         descriptor = ToolDescriptor(
-            name=self.TOOL_NAME,
+            summary="请求用户确认后再执行工具。",
+            capability_category=BuiltinToolCapabilityCategory.HUMAN_INTERACTION.value,
             capability="HITL",
         )
         super().__init__(
             tool_metadata=ToolMetadata.model(
-                name=descriptor.name,
+                name=self.TOOL_NAME,
                 tool_id=HitlTool.hitl_tool_id(source_tool_id),
                 execution_strategy=ToolExecutionStrategy.ASYNC,
                 input_model=HitlInputModel,
@@ -93,6 +98,14 @@ class HitlTool(BuildinTool[HitlInputModel]):
     @staticmethod
     def is_hitl_tool(hitl_tool_id: str) -> bool:
         return hitl_tool_id.startswith(K_HITL_TOOL_ID_PREFIX)
+
+    def resume_prompt(self):
+        approve = dump_to_static_json(HitlTool.response_data(HitlOptionType.APPROVE))
+        reject = dump_to_static_json(HitlTool.response_data(HitlOptionType.REJECT))
+        return build_bullet_list([
+            f"用户同意时：`{approve}`",
+            f"用户拒绝或不同意时：`{reject}`"
+        ])
 
     @staticmethod
     def _unsupported_sync_call(_: HitlInputModel) -> ToolResult:

@@ -91,7 +91,7 @@ POST /api/v1/sessions/{session_id}/completion
   "query": null,
   "interruption_response": {
     "request_id": "interruption_request_id:xxx",
-    "request_type": "_os_async_tool_request",
+    "request_type": "async_tool_request",
     "response": {
       "data": {
         "option": "approve"
@@ -151,7 +151,7 @@ POST /api/v1/sessions/{session_id}/completion/resume
 ```text
 id: 12
 event: chunk
-data: {"type":"message_delta","session_id":"session_id:xxx","task_id":"task_id:xxx","sequence":12,"start_ts_ms":1798867200000,"data":{"delta_content":"你好"}}
+data: {"type":"message_delta","session_id":"session_id:xxx","task_id":"task_id:xxx","sequence":12,"start_ts_ms":1798867200000,"data":{"content":"你好"}}
 ```
 
 SSE `event` 可选值：
@@ -209,11 +209,12 @@ data: {"code":0,"message":"ok","success":true,"data":{"session_id":"session_id:x
   "session_id": "session_id:xxx",
   "run_id": "run_id:xxx",
   "task_id": "task_id:xxx",
+  "agent_name": "weather_agent",
   "event_id": "event_id:xxx",
   "parent_event_id": "event_id-root",
   "sequence": 12,
   "start_ts_ms": 1798867200000,
-  "is_history_event": false,
+  "is_history_event_for_interruption": false,
   "data": {}
 }
 ```
@@ -226,11 +227,12 @@ data: {"code":0,"message":"ok","success":true,"data":{"session_id":"session_id:x
 | `session_id` | `str` | 当前会话 id。 |
 | `run_id` | `str` | 标识一次完整的 agent 运行。 |
 | `task_id` | `str | null` | 当前输入任务 id。 |
+| `agent_name` | `str | null` | 当前事件所属 Agent 名称；`complete` 取本轮最后一个稳定 history 事件的值，无稳定 history 时为 `null`。 |
 | `event_id` | `str` | 当前逻辑事件链 id。 |
 | `parent_event_id` | `str | null` | 父事件链 id，顶层事件使用 `event_id-root`。 |
 | `sequence` | `int` | 同一次 run / SSE 流内的展示顺序。 |
 | `start_ts_ms` | `int` | 当前事件创建时间，毫秒时间戳。 |
-| `is_history_event` | `bool` | 是否为 Runtime 恢复时补发的历史事件；不等同于 Redis Stream 的 SSE 重放。 |
+| `is_history_event_for_interruption` | `bool` | 是否为 Runtime 恢复时补发的历史事件；不等同于 Redis Stream 的 SSE 重放。 |
 | `data` | `dict` | 当前事件载荷。 |
 
 ### 4.6 事件类型
@@ -244,6 +246,7 @@ data: {"code":0,"message":"ok","success":true,"data":{"session_id":"session_id:x
   "type": "input",
   "data": {
     "input_id": "input_id:xxx",
+    "source": "user",
     "user_input": "帮我查一下杭州天气"
   }
 }
@@ -272,7 +275,7 @@ data: {"code":0,"message":"ok","success":true,"data":{"session_id":"session_id:x
 {
   "type": "message_delta",
   "data": {
-    "delta_content": "杭州今天"
+    "content": "杭州今天"
   }
 }
 ```
@@ -311,6 +314,22 @@ data: {"code":0,"message":"ok","success":true,"data":{"session_id":"session_id:x
 }
 ```
 
+#### agent_frame_change
+
+表示当前 Agent 控制权栈发生变更。该事件来自 `AgentFrameChangeEvent` 的 `final` 阶段，携带来源、目标、变更类型和变更原因。
+
+```json
+{
+  "type": "agent_frame_change",
+  "data": {
+    "target": "weather_agent",
+    "source": "router_agent",
+    "type": "push",
+    "reason": "handoff"
+  }
+}
+```
+
 #### tool_call
 
 表示模型选择了一个工具。该事件来自 `ToolCallEvent` 的对外投影。
@@ -337,9 +356,14 @@ data: {"code":0,"message":"ok","success":true,"data":{"session_id":"session_id:x
   "type": "tool_result",
   "data": {
     "duration_ms": 128,
-    "tool_call_id": "call_abc",
     "status": "success",
-    "content": "杭州当前晴，26 摄氏度。",
+    "tool_call_data": {
+      "id": "call_abc",
+      "name": "query_weather",
+      "parameters": {
+        "city": "杭州"
+      }
+    },
     "raw_data": {
       "city": "杭州",
       "temperature_celsius": 26
@@ -347,8 +371,6 @@ data: {"code":0,"message":"ok","success":true,"data":{"session_id":"session_id:x
   }
 }
 ```
-
-`tool_result.data.content` 是模型可见内容；工具失败时也由该字段承载失败原因，前端根据 `status` 判断展示状态。
 
 #### tool_result_start
 
@@ -411,7 +433,7 @@ data: {"code":0,"message":"ok","success":true,"data":{"session_id":"session_id:x
   "data": {
     "request_id": "interruption_request_id:xxx",
     "task_id": "task_id:xxx",
-    "interruption_type": "_os_async_tool_request",
+    "interruption_type": "async_tool_request",
     "reason": "工具 user_approval 正在异步执行",
     "params": {
       "type": "async_hitl",
@@ -443,23 +465,25 @@ data: {"code":0,"message":"ok","success":true,"data":{"session_id":"session_id:x
 | `InputEvent` | `final` | - | `input` |
 | `MessageEvent` | `in_progress` | - | `message_delta` |
 | `MessageEvent` | `final` | - | `message_final` |
+| `AgentFrameChangeEvent` | `final` | - | `agent_frame_change` |
 | `ToolCallEvent` | `final` | - | `tool_call` |
 | `ToolResultEvent` | `started` | - | `tool_result_start` |
 | `ToolResultEvent` | `final` | `result != null` | `tool_result` |
 | `ContextCompressionEvent` | `started` | `compression_mode=sync` | `context_compression`，`data.merged=false` |
 | `ContextCompressionEvent` | `final` | `compression_mode=sync` | `context_compression`，`data.merged=true` |
 | `InterruptedEvent` | `final` | - | `interrupted` |
-| Runtime 正常结束 | - | `task_id` 取本轮 history 最后一条稳定事件 | `complete`，`data` 仅携带 `duration_ms` |
+| 任务轮次切换或 Runtime 正常结束 | - | `task_id` 取本轮 history 最后一条稳定事件 | `complete`，`data` 携带 `duration_ms` 与 `is_final_complete` |
 | `CustomEvent` | 任意 | - | 按 `payload.type` 映射，未知类型透传为 `activity_indicator` 或忽略 |
 
 补充约束：
 
-- `MessageEvent.chunk.choices[].delta.content` 映射到 `message_delta.data.delta_content`。
+- `MessageEvent.chunk.choices[0].delta.content` 映射到 `message_delta.data.content`；其他候选不投影到前端。
 - 前端底部统一展示“正在思考”状态，不再依赖独立的工具选择开始事件。
 - 前端收到 `tool_call` 后创建工具标签，收到 `tool_result_start` 后切换为执行中状态，收到 `tool_result` 后按工具调用 id 匹配更新为终态。
 - `MessageEvent.completion.choices[0].message.content` 映射到 `message_final.data.content`。
+- `AgentFrameChangeEvent.payload` 映射到 `agent_frame_change.data`：目标、来源、变更类型和变更原因分别取 `target`、`source`、`type`、`reason`。
 - 具备稳定阶段语义的 `ServerMessageEvent.data` 可携带 `duration_ms` 字段；Runtime 派生 FINAL 事件由 `ResultCollector` 根据 STARTED/END 事件时间差填充。
-- Runtime 正常结束后发送一次 `complete`，且在外层 SSE `end` 之前发送；`complete.task_id` 取本轮 history 最后一条稳定事件的 `task_id`，`complete.data` 当前仅携带 `duration_ms`，该耗时由 `RuntimeEventHandler` 从 handler 创建时开始计时。
+- 同一 `run_id` 可以包含多个任务轮次。稳定 history 事件的 `task_id` 发生变化时，服务端先为上一轮发送 `complete`，其 `is_final_complete=false`；Runtime 正常结束后发送最后一个 `complete`，其 `is_final_complete=true`，随后发送外层 SSE `end`。Redis Stream 续接仅以最终 complete 作为流结束标记。`complete.task_id` 取本轮 history 最后一条稳定事件的 `task_id`，耗时从本轮开始时计时。
 - `ToolCallEvent.tool_call.function.arguments` 必须尽量解析为 JSON dict；解析失败时保留原字符串到 `parameters_text`。
 - `RuntimeEvent.duration_ms` 映射到声明了 `duration_ms` 的 `ServerMessageEvent.data.duration_ms`。
 - `ToolResultEvent.result.raw_data` 直接返回给前端，用于展示 SDK 技术细节。
@@ -626,7 +650,7 @@ GET /api/v1/sessions/{session_id}/history
 - 历史接口只返回稳定产物，不返回 `message_delta`。
 - history 写入按 `task_id` 分组，每个有效 task 只写入一条 `message_projection` 记录。
 - 一个 task 分组的首条事件必须是 `input`；无 `task_id`，或在该 task 首个 input 前到达的事件会被丢弃并记录 warning。
-- 同一 task 后续的 `input`、`message_final`、`tool_call`、`tool_result`、`context_compression` 和 `interrupted` 等稳定事件按发生顺序统一保存到该记录的 `content_json` 中。
+- 同一 task 后续的 `input`、`message_final`、`agent_frame_change`、`tool_call`、`tool_result`、`context_compression` 和 `interrupted` 等稳定事件按发生顺序统一保存到该记录的 `content_json` 中。
 - `message_projection` 不再存储 `role`，角色由前端依据事件类型和展示规则决定。
 - history 列表来自服务端应用层业务消息表，不直接读取 `BaseAgentState.history` 或 `SessionState` 快照。
 - `BaseAgentState.history` 只作为 SDK Runtime 内部上下文状态，不作为前端 history 接口的数据源。

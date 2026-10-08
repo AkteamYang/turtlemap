@@ -528,7 +528,7 @@ class MySQLStateStoreRepository:
                 row = await cursor.fetchone()
         return row is not None
 
-    async def load_agent_long_term_memory(
+    async def load_long_term_memory(
         self,
         uid: int,
     ) -> AgentLongTermMemoryRecord | None:

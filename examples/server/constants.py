@@ -9,7 +9,8 @@
 
 """示例服务端协议常量。"""
 
-SCHEMA_VERSION = 3
+# 会话 history 和 memory 已迁移到 SessionState，旧 Agent 级快照不再兼容。
+SCHEMA_VERSION = 4
 
 SSE_TIMEOUT = 2*6
 

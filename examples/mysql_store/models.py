@@ -94,7 +94,7 @@ class MessageProjectionRecord(StoreRecordModel):
 
     说明:
         该表是 examples 服务端应用层 history 数据源，不直接复用 Runtime
-        内部 `BaseAgentState.history`。
+        内部 `BaseSessionState.history`。
     """
 
     # 数据库自增主键，用于维护业务 history 的稳定展示顺序。

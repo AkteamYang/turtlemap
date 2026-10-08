@@ -14,12 +14,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 from copy import deepcopy
+from typing import TYPE_CHECKING
 
 from turtlemap.kernel.models import (
-    BaseAgentState,
+    BaseSessionState,
     MessageRole,
     RuntimeArtifact,
-    RuntimeArtifactType,
 )
 from turtlemap.kernel.models.models import BaseProcessingTask
 from turtlemap.os.llm.model import LLMMessage
@@ -50,13 +50,17 @@ from turtlemap.shared import exponential_backoff_retry
 from turtlemap.shared.ids import PREFIX_EVENT_ID, generate_prefixed_id
 from turtlemap.shared.logger import Logger
 
-from .provider import ContextBuildProvider
+from .projector import ContextProjector
 from .prompt import (
     K_SUMMARY_HISTORY,
     build_memory_section,
     build_mid_term_memory_summary_prompt,
 )
 from .tokenizer import Tokenizer
+
+if TYPE_CHECKING:
+    from turtlemap.os.agent import Agent
+
 
 MAX_COMPLETED_SUMMARY_ITEMS = 20
 
@@ -133,9 +137,9 @@ class ContextCompressionProvider(ContextCompressionProtocol):
         _ = current_result
         compression_level = ContextCompressionLevel(level)
         event_id = generate_prefixed_id(PREFIX_EVENT_ID)
-        event_bus_id = build_input.owner_agent.event_bus_id
+        event_bus_id = build_input.event_bus_id
         session_id = build_input.session_state.session_id
-        agent_name = build_input.owner_agent.agent_name
+        agent = build_input.owner_agent
 
         # 同步压缩发生在当前 run 内，需要通过事件让调用方感知硬限制兜底动作。
         await self._publish_context_compression_event(
@@ -145,14 +149,14 @@ class ContextCompressionProvider(ContextCompressionProtocol):
             task=build_input.task,
             event_bus_id=event_bus_id,
             session_id=session_id,
-            agent_name=agent_name,
+            agent=agent,
         )
 
-        # 分级压缩时中间级别允许失败，但是末级失败时需要抛出异常
-        compression_owner_agent_state = deepcopy(build_input.owner_agent_state)
+        # 分级压缩只冻结会话上下文快照，避免复制与压缩无关的 Agent 运行状态。
+        compression_session_state = deepcopy(build_input.session_state)
         try:
             compression_result = await self._compact_history_into_mid_term_memory(
-                owner_agent_state=compression_owner_agent_state,
+                session_state=compression_session_state,
                 level=compression_level,
             )
         except Exception as e:
@@ -162,12 +166,12 @@ class ContextCompressionProvider(ContextCompressionProtocol):
                 f"event_bus_id={event_bus_id}, "
                 f"session_id={session_id}, "
                 f"task_id={build_input.task.task_id}, "
-                f"agent_name={agent_name}, ",
+                f"agent_name={agent.agent_name}, ",
                 exc_info=True
             )
             compression_result = ContextCompressionResult(merged=False, success=False, error=repr(e))
         compression_result.merged = self.merge_compacted_result(
-            owner_agent_state=build_input.owner_agent_state,
+            session_state=build_input.session_state,
             compression_result=compression_result,
         )
 
@@ -179,7 +183,7 @@ class ContextCompressionProvider(ContextCompressionProtocol):
             task=build_input.task,
             event_bus_id=event_bus_id,
             session_id=session_id,
-            agent_name=agent_name,
+            agent=agent,
             compression_result=compression_result,
         )
         return compression_result.merged
@@ -214,18 +218,18 @@ class ContextCompressionProvider(ContextCompressionProtocol):
 
         event_id = generate_prefixed_id(PREFIX_EVENT_ID)
 
-        # 后台任务不能持有完整 ContextBuildInput，只冻结压缩需要的 BaseAgentState 快照。
-        background_owner_agent_state = deepcopy(build_input.owner_agent_state)
+        # 后台任务只冻结会话上下文快照，不持有完整 ContextBuildInput。
+        background_session_state = deepcopy(build_input.session_state)
         session_state = build_input.session_state
         background_task = asyncio.create_task(
             self._run_background_compression(
-                compression_owner_agent_state=background_owner_agent_state,
+                compression_session_state=background_session_state,
                 compression_task=compression_task,
-                event_bus_id=build_input.owner_agent.event_bus_id,
+                event_bus_id=build_input.event_bus_id,
                 event_id=event_id,
                 task=build_input.task,
                 session_id=session_state.session_id,
-                agent_name=build_input.owner_agent.agent_name,
+                agent=build_input.owner_agent,
                 callback=callback,
             )
         )
@@ -251,13 +255,13 @@ class ContextCompressionProvider(ContextCompressionProtocol):
     @classmethod
     def merge_compacted_result(
         cls,
-        owner_agent_state: BaseAgentState,
+        session_state: BaseSessionState,
         compression_result: ContextCompressionResult,
     ) -> bool:
         """将压缩结果安全合并回目标状态。
 
         参数:
-            owner_agent_state: 等待接收压缩结果的目标 BaseAgentState。
+            session_state: 等待接收压缩结果的目标会话状态。
             compression_result: 后台或隔离压缩生成的结果对象。
 
         返回:
@@ -271,33 +275,33 @@ class ContextCompressionProvider(ContextCompressionProtocol):
 
         # 压缩成功，合并数据
         if compression_result.level != ContextCompressionLevel.NORMAL:
-            owner_agent_state.history = list(compression_result.compressed_history)
-            owner_agent_state.memory.mid_term_memory = compression_result.compressed_mid_term_memory
+            session_state.history = list(compression_result.compressed_history)
+            session_state.memory.mid_term_memory = compression_result.compressed_mid_term_memory
             return True
 
         # level 1 的合并操作
         # RuntimeArtifact.id 是稳定历史产物的身份边界；只要快照仍是当前 history 前缀，
         # 就可以把已压缩前缀替换成摘要结果，并保留压缩期间新增的尾部消息。
         if not cls._is_history_artifact_id_prefix_matched(
-            current_history=owner_agent_state.history,
+            current_history=session_state.history,
             origin_history=compression_result.origin_history,
         ):
             return False
 
         if (
-            owner_agent_state.memory.mid_term_memory
+            session_state.memory.mid_term_memory
             != compression_result.origin_mid_term_memory
         ):
             return False
 
         # 压缩期间新增的 history 尾部必须保留，避免后台结果覆盖新对话进展。
-        appended_history = owner_agent_state.history[
+        appended_history = session_state.history[
             len(compression_result.origin_history) :
         ]
-        owner_agent_state.memory.mid_term_memory = (
+        session_state.memory.mid_term_memory = (
             compression_result.compressed_mid_term_memory
         )
-        owner_agent_state.history = (
+        session_state.history = (
             deepcopy(compression_result.compressed_history) + appended_history
         )
         return True
@@ -362,13 +366,13 @@ class ContextCompressionProvider(ContextCompressionProtocol):
     @exponential_backoff_retry(retry_exceptions=(Exception,))
     async def _rewrite_mid_term_memory(
         self,
-        owner_agent_state: BaseAgentState,
+        session_state: BaseSessionState,
         history_messages: list[LLMMessage],
     ) -> str:
         """重写当前会话的中期工作记忆。
 
         参数:
-            owner_agent_state: 当前压缩任务使用的 BaseAgentState 快照。
+            session_state: 当前压缩任务使用的会话上下文快照。
             history_messages: 本轮待吸收入中期记忆的较早历史消息列表。
 
         返回:
@@ -382,7 +386,7 @@ class ContextCompressionProvider(ContextCompressionProtocol):
         ]
 
         existing_mid_term_memory = (
-            owner_agent_state.memory.mid_term_memory.strip()
+            session_state.memory.mid_term_memory.strip()
         )
         if existing_mid_term_memory:
             summary_messages.append(
@@ -408,7 +412,9 @@ class ContextCompressionProvider(ContextCompressionProtocol):
             )
         )
         summary_message = await self.model_client_provider.generate_message(
-            messages=summary_messages
+            messages=summary_messages,
+            temperature=0.5,
+            max_tokens=8*1024,
         )
         summary_content = (summary_message.content or "").strip()
         return self.trim_completed_summary_items(summary_content, MAX_COMPLETED_SUMMARY_ITEMS)
@@ -558,13 +564,13 @@ class ContextCompressionProvider(ContextCompressionProtocol):
 
     async def _compact_history_into_mid_term_memory(
         self,
-        owner_agent_state: BaseAgentState,
+        session_state: BaseSessionState,
         level: ContextCompressionLevel = ContextCompressionLevel.NORMAL,
     ) -> ContextCompressionResult:
         """把较早 history 收敛进 `mid_term_memory`。
 
         参数:
-            owner_agent_state: 当前压缩任务使用的 BaseAgentState；调用方可传入快照或真实对象。
+            session_state: 当前压缩任务使用的会话状态；调用方可传入快照或真实对象。
             level: 当前压缩强度等级；后台压缩默认只使用 NORMAL。
 
         返回:
@@ -574,14 +580,14 @@ class ContextCompressionProvider(ContextCompressionProtocol):
             NoCompressibleHistoryError: 当前没有足够的较早 history 可供压缩。
         """
         # 记录压缩前快照，后续回调合并时用它判断目标状态是否仍可安全更新。
-        origin_mid_term_memory = owner_agent_state.memory.mid_term_memory
-        origin_history = deepcopy(owner_agent_state.history)
+        origin_mid_term_memory = session_state.memory.mid_term_memory
+        origin_history = deepcopy(session_state.history)
 
         # level 2 丢弃最近历史
         if level == ContextCompressionLevel.DROP_HISTORY:
-            retained_start_index = len(owner_agent_state.history)
-            compressed_history = owner_agent_state.history[retained_start_index:]
-            success = len(owner_agent_state.history) > 0
+            retained_start_index = len(session_state.history)
+            compressed_history = session_state.history[retained_start_index:]
+            success = len(session_state.history) > 0
             error = ""
             if not success:
                 error = f"原始历史为空，无法裁剪"
@@ -612,42 +618,32 @@ class ContextCompressionProvider(ContextCompressionProtocol):
                 origin_mid_term_memory=origin_mid_term_memory,
                 origin_history=origin_history,
                 compressed_mid_term_memory="",
-                compressed_history=owner_agent_state.history,
+                compressed_history=session_state.history,
                 compressed_history_count=0,
                 error=error
             )
 
         # level 0 合并摘要优先采取的策略。
         compressible_history = self._ensure_compressible_history(
-            history=owner_agent_state.history,
+            history=session_state.history,
             keep_recent_history_rounds=self.keep_recent_history_rounds,
         )
-        compressible_messages: list[LLMMessage] = []
-        for history_round in ContextBuildProvider._split_history_rounds(
-            compressible_history
-        ):
-            # 暂停任务尚未形成稳定会话结论，不应沉淀进中期记忆。
-            if any(
-                artifact.type == RuntimeArtifactType.INTERRUPTION_REQUEST
-                for artifact in history_round
-            ):
-                continue
-
-            for artifact in history_round:
-                compressible_messages.extend(
-                    ContextBuildProvider._artifact_to_llm_messages(artifact)
-                )
+        # 压缩侧复用正式上下文的 history 治理规则；空工具集合不会回放工具调用协议。
+        compressible_messages = ContextProjector().build_history_llm_messages(
+            history=compressible_history,
+            available_tool_names=set(),
+        )
 
         # 只把较早 history 送入摘要，尾部保留轮次继续以原始消息进入上下文。
         summary_content = await self._rewrite_mid_term_memory(
-            owner_agent_state=owner_agent_state,
+            session_state=session_state,
             history_messages=compressible_messages,
         )
-        compressed_history = owner_agent_state.history[len(compressible_history) :]
+        compressed_history = session_state.history[len(compressible_history) :]
 
         # 压缩结果进入 mid-term memory，history 只保留未被摘要化的原始尾部消息。
-        owner_agent_state.memory.mid_term_memory = summary_content
-        owner_agent_state.history = compressed_history
+        session_state.memory.mid_term_memory = summary_content
+        session_state.history = compressed_history
         return ContextCompressionResult(
             merged=False,
             level=level,
@@ -683,24 +679,24 @@ class ContextCompressionProvider(ContextCompressionProtocol):
 
     async def _run_background_compression(
         self,
-        compression_owner_agent_state: BaseAgentState,
+        compression_session_state: BaseSessionState,
         compression_task: ContextCompressionTaskRecord,
         event_bus_id: str,
         event_id: str,
         session_id: str,
         task: BaseProcessingTask,
-        agent_name: str,
+        agent: "Agent",
         callback: CompressionResultCallback | None = None,
     ) -> ContextCompressionResult | None:
         """执行一次后台 history 收敛任务。
 
         参数:
-            compression_owner_agent_state: 当前后台压缩任务捕获的 BaseAgentState 快照。
+            compression_session_state: 当前后台压缩任务捕获的会话上下文快照。
             compression_task: 当前后台压缩任务存储记录。
             event_bus_id: 当前 Runtime 绑定的事件通道标识。
             event_id: 当前压缩事件链路 id。
             session_id: 当前会话 id。
-            agent_name: 当前压缩所属 Agent 名称。
+            agent: 当前压缩所属 Agent。
             callback: 后台压缩结束后的结果回调。
 
         返回:
@@ -714,13 +710,13 @@ class ContextCompressionProvider(ContextCompressionProtocol):
             task=task,
             event_bus_id=event_bus_id,
             session_id=session_id,
-            agent_name=agent_name,
+            agent=agent,
         )
 
         # 后台压缩属于可选项，失败不影响主链路
         try:
             compression_result = await self._compact_history_into_mid_term_memory(
-                owner_agent_state=compression_owner_agent_state,
+                session_state=compression_session_state,
             )
         except Exception as e:
             Logger.logger.warning(
@@ -729,7 +725,7 @@ class ContextCompressionProvider(ContextCompressionProtocol):
                 f"event_bus_id={event_bus_id}, "
                 f"session_id={session_id}, "
                 f"task_id={task.task_id}, "
-                f"agent_name={agent_name}, "
+                f"agent_name={agent.agent_name}, "
                 f"compression_task_id={compression_task.id}, "
                 f"lease_owner={compression_task.lease_owner}", 
                 exc_info=True
@@ -750,7 +746,7 @@ class ContextCompressionProvider(ContextCompressionProtocol):
             task=task,
             event_bus_id=event_bus_id,
             session_id=session_id,
-            agent_name=agent_name,
+            agent=agent,
             compression_result=compression_result,
         )
         return compression_result
@@ -763,7 +759,7 @@ class ContextCompressionProvider(ContextCompressionProtocol):
         task: BaseProcessingTask,
         event_bus_id: str,
         session_id: str,
-        agent_name: str,
+        agent: "Agent",
         compression_result: ContextCompressionResult | None = None,
     ) -> None:
         """发布上下文压缩生命周期事件。
@@ -775,7 +771,7 @@ class ContextCompressionProvider(ContextCompressionProtocol):
             compression_result: 压缩结束后的结果；END 阶段携带。
             event_bus_id: 可选事件通道标识。
             session_id: 可选会话 id。
-            agent_name: 可选 Agent 名称。
+            agent: 当前压缩所属 Agent。
 
         返回:
             无返回值；没有事件通道时跳过发送。
@@ -800,7 +796,8 @@ class ContextCompressionProvider(ContextCompressionProtocol):
             ContextCompressionEvent(
                 event_id=event_id,
                 session_id=session_id,
-                agent_name=agent_name,
+                agent_name=agent.agent_name,
+                agent_display_name=agent.name,
                 task_id=task.task_id,
                 compression_mode=compression_mode,
                 compression_result=compression_result,

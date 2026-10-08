@@ -11,11 +11,13 @@
 
 from .decorator import ToolCallbackResult, tool
 from .models import (
+    AgentDescriptor,
     ExecutionUnit,
     ExecutionUnitResult,
     ExecutionResult,
     EmptyToolInputModel,
     JsonDict,
+    K_HANDOFF_TOOL_ID_PREFIX,
     RESERVED_UNIT_TYPE_LLM_CALL,
     RESERVED_UNIT_TYPE_TOOL_CALL,
     ToolCall,
@@ -31,12 +33,14 @@ from .service import BaseToolService, ExecutableTool
 
 __all__ = [
     "BaseToolService",
+    "AgentDescriptor",
     "ExecutionUnit",
     "ExecutionUnitResult",
     "ExecutionResult",
     "EmptyToolInputModel",
     "ExecutableTool",
     "JsonDict",
+    "K_HANDOFF_TOOL_ID_PREFIX",
     "RESERVED_UNIT_TYPE_LLM_CALL",
     "RESERVED_UNIT_TYPE_TOOL_CALL",
     "ToolCallbackResult",

@@ -16,11 +16,12 @@ from turtlemap.kernel.models import (
     BaseSessionState,
     BaseAgentState,
 )
-from turtlemap.kernel.models.enums import EventType
+from turtlemap.kernel.models.enums import EventType, TaskStatus
 from turtlemap.kernel.models.models import BaseProcessingTask, Input
 from turtlemap.os.event_bus.event_bus import EventBus
 from turtlemap.os.event_bus.models import InputEvent, InterruptedEvent, RunntimeEventBuffer, RuntimeEvent, RuntimeEventType
 from turtlemap.shared.typing import ensure_instance
+from typing_extensions import override
 
 
 @BaseAgentState.register_type
@@ -51,6 +52,16 @@ class SessionState(BaseSessionState):
     # 标识一次 Runtime 运行，拿到outputs
     run_id: str = Field(default="")
 
+    # 本次 run 已经完成任务的 event
+    finished_task_events: list[RunntimeEventBuffer] = Field(default_factory=list)
+
+    @override
+    def clean_state(self):
+        super().clean_state()
+        self.run_id = ""
+        self.finished_task_events = []
+
+
 @BaseProcessingTask.register_type
 class ProcessingTask(BaseProcessingTask):
     """表示 os 层可恢复的任务现场。
@@ -68,7 +79,7 @@ class ProcessingTask(BaseProcessingTask):
 
     @staticmethod
     async def publish(
-        task: BaseProcessingTask,
+        task: BaseProcessingTask | None,
         event_bus_id: str,
         event: RuntimeEvent,
     ) -> None:
@@ -86,16 +97,17 @@ class ProcessingTask(BaseProcessingTask):
             任务恢复后首次产生新事件时，会先重放未消费的历史事件。通道标识只
             属于投递边界，不会写入 RuntimeEvent 或持久化事件 buffer。
         """
+        if task:
+            processing_task = ensure_instance(task, ProcessingTask, "事件所属任务")
+            if not processing_task.event_buffer.did_replay:
+                for history_event in processing_task.event_buffer.events:
 
-        processing_task = ensure_instance(task, ProcessingTask, "事件所属任务")
-        if not processing_task.event_buffer.did_flush_history_events:
-            for history_event in processing_task.event_buffer.events:
-
-                # 中断恢复后将buffer中数据标记为历史数据
-                if event.event_type == RuntimeEventType.INPUT:
-                    input_event = ensure_instance(event, InputEvent)
-                    if input_event.input.events[0].event_type == EventType.INTERRUPTION_RESPONSE:
-                        history_event.is_history_event = True
-                await EventBus.publish(event_bus_id, history_event)
-            processing_task.event_buffer.did_flush_history_events = True
+                    # 中断恢复后将buffer中数据标记为历史数据
+                    if event.event_type == RuntimeEventType.INPUT:
+                        input_event = ensure_instance(event, InputEvent)
+                        if input_event.input.events[0].event_type == EventType.INTERRUPTION_RESPONSE:
+                            history_event.is_history_event_for_interruption = True
+                    history_event.is_replay_event = True
+                    await EventBus.publish(event_bus_id, history_event)
+                processing_task.event_buffer.did_replay = True
         await EventBus.publish(event_bus_id, event)

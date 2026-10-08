@@ -12,21 +12,57 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
-import tiktoken
+from modelscope.hub.snapshot_download import snapshot_download
+from transformers import AutoTokenizer
 
-from turtlemap.config import ContextTokenBudget
+from turtlemap.config import ContextTokenBudget, K_DEFAULT_TOKENIZER_MODEL
 from turtlemap.kernel.models.models import RuntimeArtifact
 from turtlemap.os.llm.model import LLMMessage
 from turtlemap.shared.ids import generate_content_hash
 from turtlemap.shared.json_parser import dump_to_static_json
 
-encoding_name2encoding: dict[str, tiktoken.Encoding] = {}
 MESSAGE_OVERHEAD_TOKENS = 4
 TOOL_CALL_OVERHEAD_TOKENS = 4
 TOOL_RESULT_OVERHEAD_TOKENS = 4
+K_PROJECT_MODELSCOPE_CACHE_DIR = Path(__file__).resolve().parents[4] / ".cache" / "modelscope"
+K_TOKENIZER_FILE_PATTERNS = [
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "chat_template.jinja",
+    "vocab.json",
+    "merges.txt",
+    "vocab.txt",
+    "tokenizer.model",
+    "spiece.model",
+    "*.tiktoken",
+]
+
+# 按 ModelScope 仓库标识复用已加载的 tokenizer，避免多个 Runtime 重复加载词表。
+model_name2modelscope_tokenizer: dict[str, Any] = {}
+
+
+def _configure_modelscope_cache_dir() -> None:
+    """配置 ModelScope 的项目级持久缓存目录。
+
+    返回:
+        无返回值。
+
+    说明:
+        缓存固定落在项目根目录下的 `.cache/modelscope`，避免默认用户目录或临时目录
+        被清理后在运行期重复下载 tokenizer 文件。
+    """
+
+    K_PROJECT_MODELSCOPE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ["MODELSCOPE_CACHE"] = str(K_PROJECT_MODELSCOPE_CACHE_DIR)
 
 
 class TokenCache:
@@ -95,43 +131,33 @@ class Tokenizer:
     """表示 os 层默认 token 统计器。
 
     说明:
-        当前实现基于 `tiktoken` 做近似真实模型规则的 token 统计，
-        并通过 `TokenCache` 缓存重复内容的统计结果，降低上下文治理中
-        的重复 CPU 开销。
+        当前实现通过 ModelScope 下载并加载 Qwen tokenizer 做近似 token 统计，
+        tokenizer 文件固定保存在项目 `.cache/modelscope`。首次实际统计时才加载，
+        避免 Runtime 初始化受网络状态影响；重复内容通过 `TokenCache` 缓存结果。
     """
 
     # 当前 tokenizer 的稳定标识，用于区分不同编码规则。
     tokenizer_identity: str
-
-    # 当前 tokenizer 内部使用的编码名称。
-    encoding_name: str
 
     # 当前 tokenizer 持有的 token 缓存。
     cache: TokenCache = field(default_factory=TokenCache)
 
     def __init__(
         self,
-        model_name: str = "gpt-4o-mini",
+        model_name: str = K_DEFAULT_TOKENIZER_MODEL,
         cache: TokenCache | None = None,
     ) -> None:
         """初始化 Tokenizer。
 
         参数:
-            model_name: 当前默认参考的模型名称。
+            model_name: ModelScope 中 tokenizer 仓库标识。
             cache: 可选外部注入的 token 缓存对象。
         """
 
-        try:
-            encoding = tiktoken.encoding_for_model(model_name)
-            encoding_name = encoding.name
-        except KeyError:
-            encoding_name = "cl100k_base"
+        _configure_modelscope_cache_dir()
 
         # 当前 tokenizer 的稳定标识。
         self.tokenizer_identity = model_name
-
-        # 当前 tokenizer 内部实际采用的编码名称。
-        self.encoding_name = encoding_name
 
         # 当前 tokenizer 持有的 token 缓存。
         self.cache = cache or TokenCache()
@@ -239,25 +265,45 @@ class Tokenizer:
         if cached_token_count is not None:
             return cached_token_count
 
-        encoding = get_encoding(self.encoding_name)
-        token_count = len(encoding.encode(content))
+        tokenizer = self._get_modelscope_tokenizer()
+        token_count = len(tokenizer.encode(content, add_special_tokens=False))
         self.cache.set(cache_key, token_count)
         return token_count
 
+    def _get_modelscope_tokenizer(self) -> Any:
+        """延迟下载并读取当前 ModelScope tokenizer。
 
-def get_encoding(encoding_name: str) -> tiktoken.Encoding:
-    """按编码名称读取并缓存 tiktoken 编码对象。
+        返回:
+            可执行 `encode` 的 tokenizer 对象。
 
-    参数:
-        encoding_name: tiktoken 编码名称。
+        异常:
+            RuntimeError: tokenizer 仓库不可用或缺少必要 tokenizer 文件时抛出。
 
-    返回:
-        可用于 encode 的 tiktoken 编码对象。
-    """
+        说明:
+            仅下载 tokenizer 配置、词表和合并规则，不下载模型权重。缓存目录固定传给
+            `snapshot_download`，避免 ModelScope 回退到用户目录。
+        """
 
-    encoding = encoding_name2encoding.get(encoding_name)
-    if encoding is None:
-        # tiktoken 编码对象加载成本较高，按名称全局缓存后复用。
-        encoding = tiktoken.get_encoding(encoding_name)
-        encoding_name2encoding[encoding_name] = encoding
-    return encoding
+        cached_tokenizer = model_name2modelscope_tokenizer.get(self.tokenizer_identity)
+        if cached_tokenizer is not None:
+            return cached_tokenizer
+
+        try:
+            tokenizer_dir = snapshot_download(
+                self.tokenizer_identity,
+                cache_dir=K_PROJECT_MODELSCOPE_CACHE_DIR,
+                allow_patterns=K_TOKENIZER_FILE_PATTERNS,
+            )
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_dir,
+                trust_remote_code=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "无法加载 ModelScope tokenizer："
+                f"model={self.tokenizer_identity}, "
+                f"cache_dir={K_PROJECT_MODELSCOPE_CACHE_DIR}"
+            ) from exc
+
+        model_name2modelscope_tokenizer[self.tokenizer_identity] = tokenizer
+        return tokenizer

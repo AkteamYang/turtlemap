@@ -20,9 +20,6 @@ class EventType(str, Enum):
     # 来自用户的新输入事件
     USER_INPUT = "user_input"
 
-    # 来自 handoff 完成结果的回流事件
-    HANDOFF_RESULT = "handoff_result"
-
     # 来自外部环境或系统观测的消息事件
     ENVIRONMENT_MESSAGE = "environment_message"
 
@@ -57,9 +54,6 @@ class TaskStateKind(str, Enum):
 
     # 表示工具循环任务
     TOOL = "tool"
-
-    # 表示 handoff 等待任务
-    HANDOFF = "handoff"
 
     # 表示自动响应任务
     AUTO_RESPONSE = "auto_response"
@@ -177,12 +171,35 @@ class TaskSwitchAction(str, Enum):
     # 暂停当前任务并结束本次 run，等待中断 response 恢复。
     PAUSE = "pause"
 
+    # push 新的ObservableEvent
+    PUSH_EVENT = "push_event"
+
 
 class InterruptionRequestType(str, Enum):
     """表示 kernel 内置的任务中断请求类型。"""
 
     # Runtime 异常回退后等待显式恢复。
-    EXCEPTION_RESUME = "_os_exception_resume"
+    EXCEPTION_RESUME = "exception_resume"
 
     # 异步工具等待外部执行结果。
-    ASYNC_TOOL_REQUEST = "_os_async_tool_request"
+    ASYNC_TOOL_REQUEST = "async_tool_request"
+
+
+class AgentFrameChangeType(str, Enum):
+    """表示 Agent 控制权栈的变更类型。"""
+
+    # 将目标 Agent 压入当前控制权栈。
+    PUSH = "push"
+
+    # 将当前 Agent 从控制权栈中移除。
+    POP = "pop"
+
+
+class AgentFrameChangeReason(str, Enum):
+    """表示 Agent 控制权栈变更的业务原因。"""
+
+    # 当前 Agent 将任务委派给目标 Agent。
+    HANDOFF = "handoff"
+
+    # 当前 handoff 任务结束并返回来源 Agent。
+    HANDOFF_RETURN = "handoff_return"

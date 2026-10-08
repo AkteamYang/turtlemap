@@ -32,7 +32,7 @@ POST /api/v1/sse/{session_id}/completion
         - user_input，用户输入的内容
     - type==chunk LLM返回的content
       - data
-        - delta_content 增量content内容
+        - content 原始增量正文
     - type==tool_call 选择了一个工具，获得一个工具后tool_call_start展示tool图标+tool_call.name，复用activity_indicator
       - data
         - name

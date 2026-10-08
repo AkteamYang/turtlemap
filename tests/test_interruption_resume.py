@@ -15,6 +15,8 @@ from types import SimpleNamespace
 
 from turtlemap.kernel.models import (
     AgentFrame,
+    AgentFrameChangeReason,
+    AgentFrameChangeType,
     BaseAgentState,
     BaseSessionState,
     EventSource,
@@ -42,7 +44,9 @@ from turtlemap.kernel.tool import (
     ToolMetadata,
     ToolResult,
 )
+from turtlemap.kernel.tool.models import K_HANDOFF_TOOL_ID_PREFIX
 from turtlemap.kernel.runtime import BaseRuntime
+from turtlemap.os.context.projector import ContextProjector
 from turtlemap.os.context.provider import ContextBuildProvider
 from turtlemap.os.event_bus.models import (
     InterruptedEvent,
@@ -50,6 +54,7 @@ from turtlemap.os.event_bus.models import (
 )
 from turtlemap.os.llm.model import LLMCompletionToolCall, LLMFunction, LLMMessage
 from turtlemap.os.tool.build_in.hitl import HitlOptionType, HitlTool
+from turtlemap.os.tool.model import AgentFrameChange
 from turtlemap.os.tool.service import ToolService
 from turtlemap.os.tool.tool import (
     LLMCallExecutionResult,
@@ -132,6 +137,8 @@ def _build_paused_task() -> BaseProcessingTask:
         task_id=task.task_id,
         type=InterruptionRequestType.EXCEPTION_RESUME,
         reason="测试中断 0",
+        assistant_content="测试中断 assistant 内容 0",
+        resume_prompt="测试中断恢复提示 0",
         origin_task_status=TaskStatus.RUNNING,
     )
     return task
@@ -174,7 +181,7 @@ def test_interruption_response_payload_restores_and_resumes_paused_task() -> Non
             "source": EventSource.USER,
             "payload": {
                 "request_id": "request:0",
-                "request_type": "_os_async_tool_request",
+                "request_type": "async_tool_request",
                 "response": {"data": {"option": "approve"}},
             },
         }
@@ -202,7 +209,7 @@ def test_paused_task_builds_lightweight_interruption_history() -> None:
     provider = ContextBuildProvider.__new__(ContextBuildProvider)
 
     artifacts = provider.build_task_artifacts(
-        owner_agent=object(),
+        owner_agent=SimpleNamespace(agent_name="agent"),
         owner_state=owner_state,
         task=task,
     )
@@ -214,9 +221,9 @@ def test_paused_task_builds_lightweight_interruption_history() -> None:
     assert isinstance(artifacts[1].payload, InterruptionRequest)
     assert artifacts[1].payload.request_id == "request:0"
 
-    messages = provider._artifact_to_llm_messages(artifacts[1])
+    messages = ContextProjector()._artifact_to_llm_messages(artifacts[1])
     assert "request:0" in messages[0].content
-    assert "测试中断 0" in messages[0].content
+    assert "测试中断恢复提示 0" in messages[0].content
 
 
 def test_unavailable_tool_history_round_is_collapsed() -> None:
@@ -257,9 +264,7 @@ def test_unavailable_tool_history_round_is_collapsed() -> None:
             ),
         ),
     ]
-    provider = ContextBuildProvider.__new__(ContextBuildProvider)
-
-    messages = provider._build_history_llm_messages(
+    messages = ContextProjector().build_history_llm_messages(
         history=history_round,
         available_tool_names=set(),
     )
@@ -273,8 +278,8 @@ def test_unavailable_tool_history_round_is_collapsed() -> None:
     assert "这是此前工具调用后的回答。" in messages[-1].content
 
 
-def test_expired_tool_result_history_round_is_collapsed() -> None:
-    """验证工具可用但结果过期时，历史轮次仍会折叠。"""
+def test_expired_tool_result_history_round_is_marked() -> None:
+    """验证工具结果过期时保留完整轮次，并以 tool 消息标记失效。"""
 
     task = _build_paused_task()
     tool_call = LLMCompletionToolCall(
@@ -324,9 +329,7 @@ def test_expired_tool_result_history_round_is_collapsed() -> None:
             ),
         ),
     ]
-    provider = ContextBuildProvider.__new__(ContextBuildProvider)
-
-    messages = provider._build_history_llm_messages(
+    messages = ContextProjector().build_history_llm_messages(
         history=history_round,
         available_tool_names={"query_weather"},
     )
@@ -334,12 +337,269 @@ def test_expired_tool_result_history_round_is_collapsed() -> None:
     assert [message.role for message in messages] == [
         MessageRole.USER,
         MessageRole.ASSISTANT,
+        MessageRole.TOOL,
+        MessageRole.ASSISTANT,
     ]
-    assert messages[0].content is not None
-    assert "本轮工具结果已过期，工具执行过程已折叠。" in messages[0].content
-    assert messages[-1].tool_calls == []
+    assert messages[2].tool_call_id == "call:expired"
+    assert messages[2].content is not None
+    assert "已过期" in messages[2].content
     assert messages[-1].content is not None
     assert "这是此前工具调用后的回答。" in messages[-1].content
+
+
+def test_handoff_tool_history_round_adds_assistant_response() -> None:
+    """验证 handoff 工具结果后会补 assistant 消息以闭合工具调用链。"""
+
+    task = _build_paused_task()
+    handoff_tool_name = f"{K_HANDOFF_TOOL_ID_PREFIX}research_agent"
+    tool_call = LLMCompletionToolCall(
+        id="call:handoff",
+        type="function",
+        function=LLMFunction(
+            name=handoff_tool_name,
+            arguments="{}",
+        ),
+    )
+    history_round = [
+        RuntimeArtifact(
+            type=RuntimeArtifactType.INPUT,
+            payload=task.start_input,
+        ),
+        RuntimeArtifact(
+            type=RuntimeArtifactType.TOOL_CALL,
+            payload=LLMMessage(
+                role=MessageRole.ASSISTANT,
+                tool_calls=[tool_call],
+            ),
+        ),
+        RuntimeArtifact(
+            type=RuntimeArtifactType.TOOL_CALL_EXE,
+            payload=ToolCallExecutionUnit(
+                tool_meta_id=handoff_tool_name,
+                tool_call=tool_call,
+                result=ToolCallExecutionResult(
+                    next_unit_status=ExecutionUnitStatus.COMPLETED,
+                    tool_result=ToolResult(content="任务已转交。"),
+                    handoff=AgentFrameChange(
+                        target="research_agent",
+                        source="main_agent",
+                        type=AgentFrameChangeType.PUSH,
+                        reason=AgentFrameChangeReason.HANDOFF,
+                    ),
+                ),
+            ),
+        ),
+    ]
+
+    messages = ContextProjector().build_history_llm_messages(
+        history=history_round,
+        available_tool_names={handoff_tool_name},
+    )
+
+    assert [message.role for message in messages] == [
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+        MessageRole.TOOL,
+        MessageRole.ASSISTANT,
+    ]
+    assert messages[-1].content == "任务已转交。"
+    assert messages[-1].tool_calls == []
+
+
+def test_unavailable_tool_with_expired_result_history_round_is_removed() -> None:
+    """验证不可用工具轮次含过期结果时不会进入 LLM 上下文。"""
+
+    task = _build_paused_task()
+    tool_call = LLMCompletionToolCall(
+        id="call:unavailable-expired",
+        type="function",
+        function=LLMFunction(
+            name="unavailable_weather",
+            arguments="{}",
+        ),
+    )
+    history_round = [
+        RuntimeArtifact(
+            type=RuntimeArtifactType.INPUT,
+            payload=task.start_input,
+        ),
+        RuntimeArtifact(
+            type=RuntimeArtifactType.TOOL_CALL,
+            payload=LLMMessage(
+                role=MessageRole.ASSISTANT,
+                tool_calls=[tool_call],
+            ),
+        ),
+        RuntimeArtifact(
+            type=RuntimeArtifactType.TOOL_CALL_EXE,
+            payload=ToolCallExecutionUnit(
+                tool_meta_id="unavailable_weather",
+                tool_call=tool_call,
+                result=ToolCallExecutionResult(
+                    next_unit_status=ExecutionUnitStatus.COMPLETED,
+                    tool_result=ToolResult(
+                        content="杭州晴，26 摄氏度。",
+                        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+                    ),
+                ),
+            ),
+        ),
+        RuntimeArtifact(
+            type=RuntimeArtifactType.TOOL_LLM_RESPONSE,
+            payload=LLMCallExecutionUnit(
+                result=LLMCallExecutionResult(
+                    next_unit_status=ExecutionUnitStatus.COMPLETED,
+                    message=LLMMessage(
+                        role=MessageRole.ASSISTANT,
+                        content="这是此前工具调用后的回答。",
+                    ),
+                )
+            ),
+        ),
+    ]
+
+    messages = ContextProjector().build_history_llm_messages(
+        history=history_round,
+        available_tool_names=set(),
+    )
+
+    assert messages == []
+
+
+def test_other_agent_history_is_injected_into_next_owner_agent_input() -> None:
+    """验证其他 Agent history 会注入下一轮当前 Agent 输入的 Task Context。"""
+
+    main_input = Input(
+        input_id="input:main",
+        events=[
+            ObservableEvent(
+                event_id="observable:main",
+                event_type=EventType.USER_INPUT,
+                source=EventSource.USER,
+                payload={"content": "请继续处理主任务"},
+            )
+        ],
+    )
+    research_input = Input(
+        input_id="input:research",
+        events=[
+            ObservableEvent(
+                event_id="observable:research",
+                event_type=EventType.USER_INPUT,
+                source=EventSource.USER,
+                payload={"content": "查询最新指标"},
+            )
+        ],
+    )
+    main_resume_input = Input(
+        input_id="input:main-resume",
+        events=[
+            ObservableEvent(
+                event_id="observable:main-resume",
+                event_type=EventType.USER_INPUT,
+                source=EventSource.USER,
+                payload={"content": "请根据指标继续处理主任务"},
+            )
+        ],
+    )
+    tool_call = LLMCompletionToolCall(
+        id="call:metrics",
+        type="function",
+        function=LLMFunction(
+            name="query_metrics",
+            arguments='{"metric":"latency"}',
+        ),
+    )
+    history = [
+        RuntimeArtifact(
+            type=RuntimeArtifactType.INPUT,
+            owner_agent_name="main_agent",
+            payload=main_input,
+        ),
+        RuntimeArtifact(
+            type=RuntimeArtifactType.ASSISTANT_MESSAGE,
+            owner_agent_name="main_agent",
+            payload=LLMMessage(
+                role=MessageRole.ASSISTANT,
+                content="我正在处理主任务。",
+            ),
+        ),
+        RuntimeArtifact(
+            type=RuntimeArtifactType.INPUT,
+            owner_agent_name="research_agent",
+            payload=research_input,
+        ),
+        RuntimeArtifact(
+            type=RuntimeArtifactType.ASSISTANT_MESSAGE,
+            owner_agent_name="research_agent",
+            payload=LLMMessage(
+                role=MessageRole.ASSISTANT,
+                content="我先查询相关指标。",
+            ),
+        ),
+        RuntimeArtifact(
+            type=RuntimeArtifactType.TOOL_CALL,
+            owner_agent_name="research_agent",
+            payload=LLMMessage(
+                role=MessageRole.ASSISTANT,
+                tool_calls=[tool_call],
+            ),
+        ),
+        RuntimeArtifact(
+            type=RuntimeArtifactType.TOOL_CALL_EXE,
+            owner_agent_name="research_agent",
+            payload=ToolCallExecutionUnit(
+                tool_meta_id="query_metrics",
+                tool_call=tool_call,
+                result=ToolCallExecutionResult(
+                    next_unit_status=ExecutionUnitStatus.COMPLETED,
+                    tool_result=ToolResult(
+                        content="平均延迟为 120ms。",
+                        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+                    ),
+                ),
+            ),
+        ),
+        RuntimeArtifact(
+            type=RuntimeArtifactType.INPUT,
+            owner_agent_name="main_agent",
+            payload=main_resume_input,
+        ),
+        RuntimeArtifact(
+            type=RuntimeArtifactType.ASSISTANT_MESSAGE,
+            owner_agent_name="main_agent",
+            payload=LLMMessage(
+                role=MessageRole.ASSISTANT,
+                content="我会结合指标继续处理。",
+            ),
+        ),
+    ]
+
+    messages = ContextProjector().build_history_llm_messages(
+        history=history,
+        available_tool_names=set(),
+        current_agent_name="main_agent",
+    )
+
+    assert [message.role for message in messages] == [
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+    ]
+    group_input = messages[2].content or ""
+    assert "# Task Context" in group_input
+    assert "## Group Input" in group_input
+    assert "<group_input>" in group_input
+    assert '<message actor="User">' in group_input
+    assert '<message actor="research_agent">' in group_input
+    assert (
+        '<tool_call actor="research_agent" name="query_metrics" id="call:metrics">'
+        in group_input
+    )
+    assert '<tool_result call_id="call:metrics">' in group_input
+    assert "【结果状态】: 已过期" in group_input
+    assert "不可作为当前事实依据" in group_input
 
 
 def test_interrupted_event_restores_interruption_request_payload() -> None:
@@ -348,8 +608,11 @@ def test_interrupted_event_restores_interruption_request_payload() -> None:
     interruption_request = InterruptionRequest(
         request_id="request:test",
         task_id="task:test",
-        type="_os_exception_resume",
+        type="exception_resume",
         reason="模型服务不可用",
+        assistant_content="模型服务不可用，任务已暂停。",
+        resume_prompt="请在确认后恢复任务。",
+        origin_task_status=TaskStatus.RUNNING,
     )
 
     event = InterruptedEvent(

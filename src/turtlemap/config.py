@@ -18,6 +18,8 @@ from typing import Any, cast
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+K_DEFAULT_TOKENIZER_MODEL = "Qwen/Qwen3.8-27B-FP8"
+
 
 @dataclass(slots=True)
 class LLMConfig:
@@ -39,6 +41,9 @@ class LLMConfig:
 
     # 当前请求超时时间，单位秒。
     timeout: float = 120.0
+
+    # 上下文 token 统计使用的 ModelScope tokenizer 仓库标识。
+    tokenizer_model: str = K_DEFAULT_TOKENIZER_MODEL
 
 
 @dataclass(slots=True)
@@ -128,6 +133,12 @@ class _TurtleMapEnvSettings(BaseSettings):
     llm_model: str = Field(
         default="gpt-4o-mini",
         validation_alias=AliasChoices("TURTLEMAP_LLM_MODEL", "TURTLEMAP_MODEL"),
+    )
+
+    # 上下文 token 统计使用的 ModelScope tokenizer 仓库标识。
+    llm_tokenizer_model: str = Field(
+        default=K_DEFAULT_TOKENIZER_MODEL,
+        validation_alias=AliasChoices("TURTLEMAP_LLM_TOKENIZER_MODEL"),
     )
 
     # 当前模型服务的访问密钥。
@@ -242,6 +253,7 @@ class TurtleMapConfig:
             llm=LLMConfig(
                 model=settings.llm_model,
                 api_key=settings.llm_api_key,
+                tokenizer_model=settings.llm_tokenizer_model,
                 base_url=settings.llm_base_url,
                 timeout=settings.llm_timeout,
             ),

@@ -18,6 +18,7 @@ from .event_bus import (
 from .models import (
     ContextCompressionEvent,
     ContextCompressionMode,
+    AgentFrameChangeEvent,
     InputEvent,
     InterruptedEvent,
     MessageEvent,
@@ -34,6 +35,7 @@ __all__ = [
     "EventBus",
     "ContextCompressionEvent",
     "ContextCompressionMode",
+    "AgentFrameChangeEvent",
     "InputEvent",
     "InterruptedEvent",
     "MessageEvent",

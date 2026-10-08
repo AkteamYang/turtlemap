@@ -12,7 +12,8 @@ type CompletionRequestBody = {
   last_event_id: string | null;
 };
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+// 默认请求当前页面所在主机的后端，支持通过局域网 IP 从移动设备访问。
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || `http://${window.location.hostname}:8000`;
 const COMPLETION_NETWORK_RETRY_COUNT = 2;
 const COMPLETION_NETWORK_RETRY_DELAY_MS = 10_000;
 

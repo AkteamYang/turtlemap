@@ -14,6 +14,7 @@ from __future__ import annotations
 from pydantic import Field
 
 from turtlemap.kernel.tool import (
+    K_HANDOFF_TOOL_ID_PREFIX,
     RESERVED_UNIT_TYPE_LLM_CALL,
     RESERVED_UNIT_TYPE_TOOL_CALL,
     ExecutionUnit,
@@ -69,9 +70,29 @@ class ToolCallExecutionUnit(ExecutionUnit):
     # 后台工具等待外部结果时对应的中断请求 id。
     async_result_request_id: str | None = None
 
+    # 是否来自LLM, 来自LLM的tool才会生成产物
+    from_llm: bool = False
+
     @property
     def real_result(self) -> ToolCallExecutionResult:
         return ensure_instance(self.result, ToolCallExecutionResult)
+
+    @property
+    def is_handoff(self) -> bool:
+        """判断当前工具调用是否为 handoff 工具。
+
+        返回:
+            工具调用函数名使用 handoff 工具 id 前缀时返回 `True`；函数信息或
+            函数名缺失时返回 `False`。
+        """
+
+        function = self.tool_call.function
+        return bool(
+            function
+            and function.name
+            and not self.tool_call.runtime_error_msg
+            and function.name.startswith(K_HANDOFF_TOOL_ID_PREFIX)
+        )
 
 
 @ExecutionUnit.register_type

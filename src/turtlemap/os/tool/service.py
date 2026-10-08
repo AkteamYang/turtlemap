@@ -25,6 +25,7 @@ from turtlemap.kernel.models import (
     InterruptionRequest,
     InterruptionRequestType,
     TaskSwitchAction,
+    TaskStatus,
     ToolExecutionStrategy,
     ToolResultStatus,
 )
@@ -35,8 +36,12 @@ from turtlemap.kernel.exceptions import (
     KernelUnsupportedOperationError,
 )
 from turtlemap.kernel.models import BaseProcessingTask, ToolState
+from turtlemap.kernel.models.enums import AgentFrameChangeReason, AgentFrameChangeType
 from turtlemap.kernel.models.models import BaseSessionState, Input, RuntimeArtifact, RuntimeArtifactType
 from turtlemap.kernel.tool.models import (
+    K_HANDOFF_TOOL_ID_PREFIX,
+    K_RAW_DATA_EVENT,
+    K_RAW_DATA_HANDOFF,
     RESERVED_UNIT_TYPE_LLM_CALL,
     RESERVED_UNIT_TYPE_TOOL_CALL,
 )
@@ -61,6 +66,7 @@ from turtlemap.kernel.tool import (
 )
 from turtlemap.os.models import ProcessingTask
 from turtlemap.os.tool.build_in.hitl import K_HITL_TOOL_ID_PREFIX, HitlTool
+from turtlemap.os.tool.build_in.resume_task import K_TOOL_NAME_RESUME_TASK
 from turtlemap.os.tool.enums import AsyncToolType
 from turtlemap.shared.ids import (
     PREFIX_EVENT_ID,
@@ -73,7 +79,10 @@ from turtlemap.shared.json_parser import sanitize_json_string
 from turtlemap.shared.logger import Logger
 from turtlemap.shared.typing import ensure_instance
 
-from .model import ToolInputContext
+from .model import (
+    AgentFrameChange,
+    ToolInputContext,
+)
 from .tool import (
     LLMCallExecutionUnit,
     LLMCallExecutionResult,
@@ -187,45 +196,66 @@ class ToolService(BaseToolService):
             assistant message，保证 kernel 保存的是已经过 os 层校验的产物。
         """
 
+        from turtlemap.os.agent import Agent
+
         assistant_message = ensure_instance(
             message.payload,
             LLMMessage,
             "assistant 工具调用消息",
         )
+        should_add_llm = True
         execution_units: list[ExecutionUnit] = []
-        valid_tool_calls: list[LLMCompletionToolCall] = []
-        for tool_call in assistant_message.tool_calls:
-            tool_call_id = tool_call.id
+        for tool_call_index, tool_call in enumerate(assistant_message.tool_calls):
             function = tool_call.function
-            if tool_call_id is None or function is None or function.name is None:
-                Logger.logger.warning(f"assistant 工具调用消息缺少必要的 id 或 function.name, agent_name {agent.agent_name}, input {task.start_input}, tool_call {tool_call}", exc_info=True)
-                continue
-
-            executable_tool = agent.tool_provider.get_tool_by_id(function.name)
-            if not executable_tool:
-                Logger.logger.warning(f"assistant 工具调用无效的工具名: {function.name}, agent_name {agent.agent_name}, input {task.start_input}, tool_call {tool_call}", exc_info=True)
-                continue
-
-            # 增加前置 hitl 节点
-            if executable_tool.tool_metadata.requires_confirmation:
-                hitl_tool_id = HitlTool.hitl_tool_id(executable_tool.tool_metadata.id)
-                hitl_execution_unit = ToolCallExecutionUnit(
-                    tool_meta_id=hitl_tool_id,
-                    tool_call=LLMCompletionToolCall(
-                        id=generate_prefixed_id(PREFIX_TOOL_CALL_ID),
-                        function=LLMFunction(
-                            name=hitl_tool_id,
-                            arguments=HitlTool.request_params_str(source_tool_id=executable_tool.tool_metadata.id)
-                        )
-                    )
-                )
-                execution_units.append(hitl_execution_unit)
             tool_execution_unit = ToolCallExecutionUnit(
-                tool_meta_id=executable_tool.tool_metadata.id,
+                tool_meta_id="",
                 tool_call=tool_call,
+                from_llm=True
             )
+            while True:
+
+                # 工具名为空
+                if function.name is None:
+                    tool_call.runtime_error_msg = f"工具名为空，agent_name: {agent.agent_name}, tool id: {tool_call.id}"
+                    Logger.logger.warning(tool_call.runtime_error_msg)
+                    break
+
+                # 工具名不可用
+                if function.name not in assistant_message.available_funtion_names:
+                    tool_call.runtime_error_msg = f"工具名 `{function.name}` 错误，它不在可用工具名列表中，可用工具名列表：{assistant_message.available_funtion_names}，agent_name: {agent.agent_name}"
+                    Logger.logger.warning(tool_call.runtime_error_msg)
+                    break
+
+                # 工具获取失败
+                executable_tool = agent.tool_provider.get_tool_by_id(function.name)
+                if not executable_tool:
+                    tool_call.runtime_error_msg = f"工具 `{function.name}` 获取失败，可用工具名列表：{assistant_message.available_funtion_names}，agent_name: {agent.agent_name}"
+                    Logger.logger.warning(tool_call.runtime_error_msg)
+                    break
+
+                # 增加前置 hitl 节点
+                if executable_tool.tool_metadata.requires_confirmation:
+                    hitl_tool_id = HitlTool.hitl_tool_id(executable_tool.tool_metadata.id)
+                    hitl_execution_unit = ToolCallExecutionUnit(
+                        tool_meta_id=hitl_tool_id,
+                        tool_call=LLMCompletionToolCall(
+                            id=generate_prefixed_id(PREFIX_TOOL_CALL_ID),
+                            function=LLMFunction(
+                                name=hitl_tool_id,
+                                arguments=HitlTool.request_params_str(source_tool_id=executable_tool.tool_metadata.id)
+                            )
+                        ),
+                        from_llm=False
+                    )
+                    execution_units.append(hitl_execution_unit)
+                tool_execution_unit = ToolCallExecutionUnit(
+                    tool_meta_id=executable_tool.tool_metadata.id,
+                    tool_call=tool_call,
+                    from_llm=True
+                )
+                break
+            
             execution_units.append(tool_execution_unit)
-            valid_tool_calls.append(tool_call)
 
             # 发送 tool call 事件
             await ProcessingTask.publish(
@@ -235,20 +265,42 @@ class ToolService(BaseToolService):
                     event_id=generate_prefixed_id(PREFIX_EVENT_ID),
                     session_id=self.os_service.real_session_state.session_id,
                     agent_name=agent.agent_name,
+                    agent_display_name=ensure_instance(
+                        agent,
+                        Agent,
+                        "ToolCallEvent 所属 Agent",
+                    ).name,
                     task_id=task.task_id,
                     event_phase=RuntimeEventPhase.FINAL,
                     tool_call=tool_call,
                 )
             )
-        if execution_units:
+
+            # handoff 接管当前任务后，来源 Agent 不再执行同一消息中的后续工具调用。
+            if tool_execution_unit.is_handoff:
+                ignored_tool_call_count = (
+                    len(assistant_message.tool_calls) - tool_call_index - 1
+                )
+                if ignored_tool_call_count > 0:
+                    Logger.logger.warning(
+                        "handoff 工具调用后忽略同一 assistant 消息中的后续工具调用："
+                        f"handoff_tool_call_id={tool_call.id}，"
+                        f"ignored_tool_call_count={ignored_tool_call_count}，"
+                        f"agent_name={agent.agent_name}"
+                    )
+                should_add_llm = False
+                break
+
+        if execution_units and should_add_llm:
 
             # 工具执行结束后补一轮 continuation LLM 调用，保持 tool loop 统一闭合。
+            no_tool_call = False
+            if isinstance(execution_units[-1], ToolCallExecutionUnit) \
+                and execution_units[-1].tool_meta_id == K_TOOL_NAME_RESUME_TASK:
+                no_tool_call = True
             execution_units.append(
-                LLMCallExecutionUnit()
+                LLMCallExecutionUnit(no_tool_call=no_tool_call)
             )
-
-        # kernel 不理解 LLMMessage 细节，有效 tool_calls 的裁剪必须在 os 边界完成。
-        assistant_message.tool_calls = valid_tool_calls
         return execution_units
 
     @override
@@ -263,8 +315,95 @@ class ToolService(BaseToolService):
             agent=agent,
             session_state=session_state
         )
-        tools = [t for t in tools if not t.tool_metadata.id.startswith(K_HITL_TOOL_ID_PREFIX)]
-        return tools
+        return self._filter_runtime_available_tools(tools, session_state)
+
+    def _build_handoff_state(
+        self,
+        owner_agent: BaseAgent,
+        excution_unit: ExecutionUnit,
+    ) -> AgentFrameChange:
+        """从 LLM 工具调用产物构建首个有效 handoff 状态。
+
+        参数:
+            excution_unit: 当前 assistant 生成的工具调用 Runtime 产物。
+            session_state: 当前会话状态，预留给 handoff 运行期状态校验。
+
+        返回:
+            包含目标 Agent 和 handoff artifact 的任务状态；消息不包含有效
+            handoff 工具调用时返回 `None`。
+
+        说明:
+            os 层在此处将 `RuntimeArtifact.payload` 精确收窄为 `LLMMessage`，
+            并构建 handoff artifact，避免 kernel 依赖或探测具体 LLM 载荷结构。
+        """
+        tool_execution_unit = ensure_instance(excution_unit, ToolCallExecutionUnit)
+        function = tool_execution_unit.tool_call.function
+        handoff_target = (function.name or "").removeprefix(K_HANDOFF_TOOL_ID_PREFIX)
+        if not handoff_target:
+            raise OSRuntimeError(f"handoff_target 不存在，agent: {owner_agent.agent_name}, tool_meta_id: {tool_execution_unit.tool_meta_id}")
+
+        return AgentFrameChange(
+                    target=handoff_target,
+                    source=owner_agent.agent_name,
+                    type=AgentFrameChangeType.PUSH,
+                    reason=AgentFrameChangeReason.HANDOFF,
+                )
+
+    def _filter_runtime_available_tools(
+        self,
+        tools: list[ExecutableTool],
+        session_state: BaseSessionState,
+    ) -> list[ExecutableTool]:
+        """按当前运行时状态筛选可暴露给 LLM 的工具。
+
+        参数:
+            tools: 工具提供器返回的候选工具列表。
+            session_state: 当前会话状态，用于读取当前 Agent 的暂停任务。
+
+        返回:
+            已移除当前不应暴露给 LLM 的工具列表。
+
+        说明:
+            HITL 工具仅由 ToolService 在工具执行链中内部创建，不直接提供给 LLM。
+            `resume_task` 仅在当前 Agent 存在暂停任务时可用，避免模型生成无目标的恢复调用。
+            handoff 目标已处于当前控制权栈时不再暴露，避免形成循环委派。
+        """
+
+        current_agent_state = session_state.agent_name2agent_state.get(self.agent_name)
+        has_paused_task = current_agent_state is not None and any(
+            processing_task.state.status == TaskStatus.PAUSED
+            for processing_task in current_agent_state.processing_tasks
+        )
+        frame_agent_names = {
+            agent_frame.agent_name
+            for agent_frame in session_state.agent_frames
+        }
+        filtered_tools: list[ExecutableTool] = []
+        for tool in tools:
+            tool_id = tool.tool_metadata.id
+
+            # HITL 工具是执行链内部实现，不允许由 LLM 直接选择。
+            if tool_id.startswith(K_HITL_TOOL_ID_PREFIX):
+                continue
+
+            # 没有暂停任务时，恢复工具没有可处理的目标。
+            if not has_paused_task and tool_id == K_TOOL_NAME_RESUME_TASK:
+                continue
+
+            # 已在控制权栈中的 Agent 不能再次作为 handoff 目标，避免循环委派。
+            if tool.tool_metadata.is_handoff:
+                handoff_target = tool_id.removeprefix(K_HANDOFF_TOOL_ID_PREFIX)
+                if handoff_target in frame_agent_names:
+                    Logger.logger.warning(
+                        "handoff 目标 Agent 已在当前控制权栈中，过滤工具："
+                        f"handoff_target={handoff_target}，"
+                        f"tool_id={tool_id}，"
+                        f"agent_frames={[frame.agent_name for frame in session_state.agent_frames]}"
+                    )
+                    continue
+
+            filtered_tools.append(tool)
+        return filtered_tools
 
     async def _execute_tool_call_unit(
         self,
@@ -284,9 +423,11 @@ class ToolService(BaseToolService):
             当前流程先处理执行前确认，再依次执行参数校验、生命周期
             回调与真实工具调用；后台工具会在同一单元内等待外部结果。
         """
+        from turtlemap.os.agent import Agent
+
         start_ts_ms = int(time.time() * 1000)
         tool_call = execution_unit.tool_call
-        tool_call_id = tool_call.id or ""
+        tool_call_id = tool_call.id
         tool_name = tool_call.function.name if tool_call.function else ""
         tool_id = execution_unit.tool_meta_id
         tool_metadata = {
@@ -307,6 +448,11 @@ class ToolService(BaseToolService):
                     event_id=event_id,
                     session_id=self.os_service.real_session_state.session_id,
                     agent_name=context.agent.agent_name,
+                    agent_display_name=ensure_instance(
+                        context.agent,
+                        Agent,
+                        "ToolResultEvent 所属 Agent",
+                    ).name,
                     task_id=context.task.task_id,
                     event_phase=event_phase,
                     tool_call=tool_call,
@@ -316,6 +462,18 @@ class ToolService(BaseToolService):
             )
 
         try:
+
+            # 如果 runtime 已经明确工具异常，直接跳到错误处理
+            if tool_call.runtime_error_msg:
+                raise _ToolCallExecutionFailure(
+                        reason=tool_call.runtime_error_msg,
+                        raw_data={
+                            "failure_stage": "tool_call.runtime_error_msg",
+                            "tool_meta_id": execution_unit.tool_meta_id,
+                            "tool_call_id": tool_call.id,
+                        },
+                    )
+
             function = self._resolve_tool_call_function(
                 execution_unit=execution_unit,
             )
@@ -403,6 +561,8 @@ class ToolService(BaseToolService):
                 next_unit_status=next_unit_status,
                 tool_result=tool_result,
                 raw_data=tool_result.raw_data,
+                task_switch_action=self._resolve_task_switch_action(tool_result),
+                handoff=tool_result.raw_data.get(K_RAW_DATA_HANDOFF, None),
                 error=tool_result.content if tool_result.status == ToolResultStatus.FAILED else None,
             )
         except _ToolCallExecutionFailure as exc:
@@ -462,15 +622,6 @@ class ToolService(BaseToolService):
                 task=context.task,
                 message=artifact,
             )
-
-            # 当tool_call无效时，强制关闭tool，重新生成
-            if not appended_execution_units:
-                Logger.logger.warning(f"{type(execution_unit)} 生成tool_call失败，禁用tool，待重新生成")
-                execution_unit.no_tool_call = True
-                return LLMCallExecutionResult(
-                    next_unit_status=ExecutionUnitStatus.PENDING,
-                )
-
         return LLMCallExecutionResult(
             message=ensure_instance(artifact.payload, LLMMessage),
             next_unit_status=ExecutionUnitStatus.COMPLETED,
@@ -552,7 +703,7 @@ class ToolService(BaseToolService):
         """
 
         tool_call = execution_unit.tool_call
-        if not tool_call.id or tool_call.function is None or not tool_call.function.name:
+        if not tool_call.function.name:
             raise _ToolCallExecutionFailure(
                 reason=(
                     "工具调用执行单元缺少必要字段："
@@ -785,6 +936,36 @@ class ToolService(BaseToolService):
             当前工具执行生成的标准结果；首次发起异步工具请求时返回暂停型执行结果。
         """
         try:
+            # handoff
+            if execution_unit.is_handoff:
+                agent_frame_change = self._build_handoff_state(
+                    owner_agent=context.agent,
+                    excution_unit=execution_unit,
+                )
+
+                from turtlemap.os.agent import Agent
+
+                source_agent = ensure_instance(
+                    context.agent_name2agent.get(agent_frame_change.source),
+                    Agent,
+                    "handoff 来源 Agent",
+                )
+                target_agent = ensure_instance(
+                    context.agent_name2agent.get(agent_frame_change.target),
+                    Agent,
+                    "handoff 目标 Agent",
+                )
+                tool_result = ToolResult(
+                    status=ToolResultStatus.SUCCESS,
+                    content=f"会话控制权将从 `{source_agent.name}` 转交给 `{target_agent.name}`",
+                    purpose="handoff",
+                    raw_data={
+                        K_RAW_DATA_HANDOFF: agent_frame_change
+                    }
+                )
+                return tool_result
+
+            # 普通 tool 执行
             return await executable_tool(input_model)
         except Exception as exc:
             reason=(
@@ -884,19 +1065,30 @@ class ToolService(BaseToolService):
         match tool_type:
             case AsyncToolType.HITL:
                 hitl_tool = ensure_instance(executable_tool, HitlTool)
-                reason = f"工具 {hitl_tool.source_tool_id} 执行需要用户审批。"
+                resume_prompt = hitl_tool.resume_prompt()
+                assistant_content = f"工具 {hitl_tool.source_tool_id} 执行需要审批，需要执行该工具吗？请回复同意或不同意。"
             case _:
-                reason = f"工具 {executable_tool.tool_metadata.name} 已发起异步执行。"
+                resume_prompt = ""
+                assistant_content = f"工具 {executable_tool.tool_metadata.name} 已发起异步执行，收到结果后将继续处理。"
+
+        from turtlemap.os.agent import Agent
+
         request, _ = await self.os_service.perform_interruption_request(
             task=ensure_instance(context.task, ProcessingTask),
             agent_name=context.agent.agent_name,
+            agent_display_name=ensure_instance(
+                context.agent,
+                Agent,
+                "异步工具中断任务所属 Agent",
+            ).name,
             type=InterruptionRequestType.ASYNC_TOOL_REQUEST,
-            reason=reason,
+            assistant_content=assistant_content,
             request_params={
                 "tool_id": execution_unit.tool_meta_id,
                 "type": tool_type,
                 "data": input_model.model_dump()
-            }
+            },
+            resume_prompt=resume_prompt
         )
         execution_unit.async_result_request_id = request.request_id
         tool_result = ToolResult(
@@ -970,6 +1162,26 @@ class ToolService(BaseToolService):
         
         return ExecutionUnitStatus.COMPLETED
 
+    def _resolve_task_switch_action(
+        self,
+        tool_result: ToolResult,
+    ) -> TaskSwitchAction | None:
+        """根据工具结果推导 Runtime 需要执行的任务切换动作。
+
+        参数:
+            tool_result: 当前工具函数调用形成的稳定结果。
+
+        返回:
+            当结果原始数据携带 `event` 时返回 `PUSH_EVENT`；其他场景不触发
+            任务切换。
+        """
+
+        raw_data = tool_result.raw_data
+        if isinstance(raw_data, dict) and K_RAW_DATA_EVENT in raw_data:
+            return TaskSwitchAction.PUSH_EVENT
+
+        return None
+
     def _get_background_tool_placeholder(self, tool_result: ToolResult) -> str:
         """从 ToolResult 中提取后台工具占位描述文本。"""
 
@@ -993,7 +1205,7 @@ class ToolService(BaseToolService):
             已装配的工具对象。
         """
 
-        executable_tool = self.tools.get(tool_meta_id)
+        executable_tool = self.get_tool_by_id(tool_meta_id)
         if executable_tool is None:
             raise KernelToolLookupError(
                 f"未找到指定元信息 id 的工具：tool_meta_id={tool_meta_id}"

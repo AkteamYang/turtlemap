@@ -158,7 +158,7 @@ type InterruptedBlock = {
   type: "interrupted";
   id: string;
   requestId: string;
-  interruptionType: "_os_exception_resume" | "_os_async_tool_request";
+  interruptionType: "exception_resume" | "async_tool_request";
   title: string;
   actions: Array<"retry" | "approve" | "reject">;
   metadata?: Record<string, unknown>;
@@ -196,7 +196,7 @@ assistant 消息块更新规则：
 | `message_delta` | 若当前 assistant 消息没有文本块，则新增一个 `text` 块；后续 delta 追加到该文本块内容中。文本块展示在 `thinking` 标签上方，保证“正在思考”始终位于底部。 |
 | `message_final` | 使用稳定最终文本修正当前 `text` 块，并补充 `reasoningContent`、`finish_reason`、`usage` 等可展示元信息。 |
 | `tool_call` | 新增一个 `tool` 来源的 `activity_label` 块，状态为 `loading`，内容展示工具图标、工具名、参数摘要。 |
-| `tool_result` | 根据 `tool_call_id` 匹配 `tool_call.data.id`，将对应 `activity_label` 状态改为 `normal`，`subtitle` 展示工具耗时和结果状态。 |
+| `tool_result` | 根据 `tool_call.data.id = tool_result.data.tool_call_data.id` 匹配，将对应 `activity_label` 状态改为 `normal`，`subtitle` 展示工具耗时和结果状态。 |
 | `context_compression` 开始 | 新增一个 `context_compression` 来源的 `activity_label` 块，状态为 `loading`。 |
 | `context_compression` 结束 | 将对应压缩 `activity_label` 改为 `normal`，`subtitle` 展示压缩耗时和压缩历史条数。 |
 | `interrupted` | 新增一个 `interrupted` 卡片块，展示中断原因对应的文案和可用操作按钮。卡片位于 `thinking`、`completion` 等尾部状态块之前。 |
@@ -208,17 +208,17 @@ assistant 消息块更新规则：
 
 | `data.interruption_type` | 卡片标题 | 操作按钮 |
 | --- | --- | --- |
-| `_os_exception_resume` | `任务因运行异常暂停，是否需要重试？` | `重试` |
-| `_os_async_tool_request`，且 `data.params.type="async_hitl"` | `请确认是否继续执行该操作?` | `同意`、`拒绝` |
-| `_os_async_tool_request`，其他 `data.params.type` | `任务正在等待外部工具返回结果，收到结果后将继续处理。` | 无 |
+| `exception_resume` | `任务因运行异常暂停，是否需要重试？` | `重试` |
+| `async_tool_request`，且 `data.params.type="async_hitl"` | `请确认是否继续执行该操作?` | `同意`、`拒绝` |
+| `async_tool_request`，其他 `data.params.type` | `任务正在等待外部工具返回结果，收到结果后将继续处理。` | 无 |
 
 卡片应延续 assistant 消息的白底、细描边和圆角视觉，不使用用户消息蓝色背景。卡片区域用于打开字段详情，按钮单独调用 `POST /api/v1/sessions/{session_id}/completion`。每次按钮操作使用新的 `client_event_id`、固定 `last_event_id=null`，并传入 `event_type="interruption_response"`、`query=null` 与完整 `interruption_response`：
 
 | 卡片类型 / 按钮 | `interruption_response` |
 | --- | --- |
-| `_os_exception_resume` / 重试 | `{ request_id, request_type: "_os_exception_resume", response: {} }` |
-| `_os_async_tool_request` + `async_hitl` / 同意 | `{ request_id, request_type: "_os_async_tool_request", response: { data: { option: params.data.options[0] } } }` |
-| `_os_async_tool_request` + `async_hitl` / 拒绝 | `{ request_id, request_type: "_os_async_tool_request", response: { data: { option: params.data.options[1] } } }` |
+| `exception_resume` / 重试 | `{ request_id, request_type: "exception_resume", response: {} }` |
+| `async_tool_request` + `async_hitl` / 同意 | `{ request_id, request_type: "async_tool_request", response: { data: { option: params.data.options[0] } } }` |
+| `async_tool_request` + `async_hitl` / 拒绝 | `{ request_id, request_type: "async_tool_request", response: { data: { option: params.data.options[1] } } }` |
 
 `start.code` 处理规则：
 

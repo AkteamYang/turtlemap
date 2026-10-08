@@ -37,6 +37,7 @@ export type ServerMessageType =
   | "input"
   | "activity_indicator"
   | "message_delta"
+  | "message_partial"
   | "message_final"
   | "tool_call"
   | "tool_result_start"
@@ -51,10 +52,11 @@ export type ServerMessageEvent = {
   session_id: string;
   run_id: string;
   task_id: string | null;
+  agent_name?: string | null;
   event_id: string;
   parent_event_id: string | null;
   start_ts_ms: number;
-  is_history_event: boolean;
+  is_history_event_for_interruption: boolean;
   data: Record<string, unknown>;
 };
 
@@ -106,6 +108,7 @@ export type ActivityLabelBlock = {
   source: "thinking" | "tool" | "context_compression" | "activity" | "error";
   sourceId?: string | null;
   approvalPending?: boolean;
+  detailEvents?: ServerMessageEvent[];
   metadata?: Record<string, unknown>;
 };
 

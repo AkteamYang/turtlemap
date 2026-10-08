@@ -23,6 +23,8 @@ from .models import (
     K_AGENT_DEFINITION,
     K_FRAMEWORK_INSTRUCTION,
     SystemInstruction,
+    TaskInput,
+    TaskInputContextItem,
 )
 from .tokenizer import TokenCache, Tokenizer
 
@@ -63,6 +65,8 @@ __all__ = [
     "K_AGENT_DEFINITION",
     "K_FRAMEWORK_INSTRUCTION",
     "SystemInstruction",
+    "TaskInput",
+    "TaskInputContextItem",
     "TokenCache",
     "Tokenizer",
 ]

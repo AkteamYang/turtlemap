@@ -16,9 +16,10 @@ from typing import TYPE_CHECKING, Any
 from typing_extensions import override
 
 from turtlemap.kernel.agent import BaseAgent
-from turtlemap.kernel.tool import BaseToolService, ExecutableTool
+from turtlemap.kernel.tool import AgentDescriptor, ExecutableTool
 from turtlemap.config import ContextTokenBudget, TurtleMapConfig
 from turtlemap.os.context.models import SystemInstruction
+from turtlemap.os.tool.build_in.resume_task import ResumeTaskTool
 from turtlemap.shared.typing import ensure_instance
 
 from .tool import ToolService
@@ -36,7 +37,10 @@ class Agent(BaseAgent):
         使用 os 层的工具管理与 ExecutionUnit 构造逻辑。
     """
 
-    __slots__ = ("config", "event_bus_id")
+    # os Agent 统一使用支持执行单元构造的 ToolService。
+    tool_service_cls = ToolService
+
+    __slots__ = ("config",)
 
     def __init__(
         self,
@@ -45,7 +49,7 @@ class Agent(BaseAgent):
         config: TurtleMapConfig | None = None,
         tools: list[ExecutableTool | Any] | None = None,
         handoffs: list[BaseAgent] | None = None,
-        event_bus_id: str | None = None,
+        descriptor: AgentDescriptor | None = None,
     ) -> None:
         """初始化 os 层默认 Agent。
 
@@ -53,14 +57,15 @@ class Agent(BaseAgent):
             agent_name: Agent 的稳定业务名称。
             system: 当前 Agent 的结构化系统定义。
             config: 当前 Agent 使用的完整应用配置；为空时从环境变量读取。
+            descriptor: 当前 Agent 作为 handoff 目标时对模型暴露的工具描述。
             tools: 当前 Agent 直接声明的工具对象列表。
-            handoffs: 当前 Agent 可 handoff 到的下游 Agent 列表。
-            event_bus_id: 当前 Agent 绑定的事件通道标识；为空时由 Runtime 创建。
+            handoffs: 当前 Agent 可委派给下游 Agent 的目标 Agent 列表。
         """
 
         super().__init__(
             agent_name=agent_name,
             system=system,
+            descriptor=descriptor,
             tools=tools,
             handoffs=handoffs,
         )
@@ -68,8 +73,19 @@ class Agent(BaseAgent):
         # 当前 Agent 的完整应用配置，Runtime 会传给 OSService 统一分发。
         self.config = config or TurtleMapConfig.from_env()
 
-        # 当前 Agent 绑定的事件通道；未显式传入时由 Runtime 初始化阶段创建。
-        self.event_bus_id: str = event_bus_id or ""
+    @property
+    def name(self) -> str:
+        """读取 Agent 的对外展示名称。
+
+        返回:
+            当前 `SystemInstruction.name` 中定义的展示名称。
+
+        说明:
+            `name` 用于用户与其他 Agent 可见的身份表达；运行期解析、持久化和工具 id
+            仍使用稳定的 `agent_name`。
+        """
+
+        return ensure_instance(self.system, SystemInstruction).name or self.agent_name
 
     @property
     def context_token_budget(self) -> ContextTokenBudget:
@@ -95,7 +111,7 @@ class Agent(BaseAgent):
         tool_provider._os_service = os_service
 
     @override
-    def build_tool_provider(self, tools: list[ExecutableTool | Any]) -> BaseToolService:
+    def build_tool_provider(self, tools: list[ExecutableTool | Any]) -> ToolService:
         """根据工具列表构建 os 层默认 ToolService。
 
         参数:
@@ -107,8 +123,11 @@ class Agent(BaseAgent):
 
         from turtlemap.os.tool.build_in import RecollectionTool
 
-        effective_tools = list(tools)
-        
-        # 系统级工具在构建工具服务时固定注入，业务 Agent 不需要声明。
-        effective_tools.append(RecollectionTool())
-        return ToolService.from_tools(effective_tools)
+        # 系统级工具固定位于最前，业务 Agent 不需要显式声明。
+        system_tools = [RecollectionTool(), ResumeTaskTool()]
+
+        # 复用 kernel 对系统工具、业务工具与 handoff 工具的统一装配。
+        return ensure_instance(
+            super().build_tool_provider(system_tools + tools),
+            ToolService,
+        )
