@@ -61,7 +61,7 @@ TurtleMap围绕以下原则演进：
 | 可恢复异步Request/Response | 将HITL和后台任务回流统一抽象为任务挂起、响应关联与断点恢复 |
 | Tool Execution | Tool Schema、参数校验、同步/异步调用、统一ToolResult和系统工具注入 |
 | Context Engineering | Token Budget、同步/后台压缩、历史折叠与压缩结果一致性合并 |
-| 统一上下文感知 | 将多 Agent 消息、共享记忆、系统指令与外部插入信息统一纳入会话上下文，按当前 Agent 与任务视角投影，不受原生 LLM 消息格式限制 |
+| 统一上下文模型 | 以System、Memory、History与Task Input表达多路运行信息；多 Agent、记忆与外部事件按当前 Agent 和任务视角投影，不受原生 LLM 消息格式限制 |
 | Handoff | 将目标 Agent 暴露为控制权转移工具，支持 frame push/pop、空 `HANDOFF` 输入唤起、继续标记保留与显式归还 |
 | Agent Memory | 长期/中期记忆管理、历史压缩和模型上下文注入 |
 | Event Bus / ResultCollector | 分发结构化Runtime事件，并从事件流聚合稳定运行结果 |
@@ -79,7 +79,7 @@ flowchart LR
         subgraph OS[OS Layer]
             direction TB
             Runtime[Runtime<br/>运行编排与恢复]
-            Context[Context Engineering<br/>上下文投影与压缩]
+            Context[Unified Context<br/>上下文构建、投影与压缩]
             Collaboration[Multi-Agent Collaboration<br/>Handoff 与 Agent frame]
             Service[OSService<br/>工具、消息与中断治理]
             Interceptor[Agent Interceptor<br/>输入与流式消息治理]
@@ -169,9 +169,11 @@ Task Suspend → Response Correlation → Resume
 
 任务等待外部结果时保存执行上下文并释放当前执行权；响应返回后通过`task_id / request_id`定位挂起任务，将结果注入原工具执行链并从稳定断点继续运行。
 
-### 3. Context Engineering与Memory
+### 3. 统一上下文模型与Memory
 
-TurtleMap通过Token Budget控制模型上下文，在不同阈值下选择同步压缩或后台压缩：
+TurtleMap 以 `System`、`Memory`、`History` 与 `Task Input` 组织模型输入。`Task Input` 是当前构建期的输入结构；普通历史输入回归纯用户消息，携带 `Group Input` 的历史输入才恢复为简化输入结构。多 Agent、系统控制信息和外部插入材料通过 `Task Context / Group Input` 表达，不受原生 LLM message 角色限制。
+
+在此基础上，通过 Token Budget 控制模型上下文，并在不同阈值下选择同步压缩或后台压缩：
 
 - 硬限制触发同步压缩，保证当前请求不会超过模型上下文窗口；
 - 软限制触发后台压缩，不阻塞当前回复；
@@ -179,7 +181,7 @@ TurtleMap通过Token Budget控制模型上下文，在不同阈值下选择同�
 - 长期与中期记忆由StateStore加载，并在构建上下文时注入模型；
 - 按当前 Agent、工具可用性和结果时效投影历史工具过程，避免旧工具协议或过期事实继续影响当前推理。
 
-### 4. 会话级多 Agent 与Handoff
+### 4. 多 Agent 与Handoff
 
 多 Agent 不维护彼此隔离的聊天副本。history 与 memory 归属于 Session，`RuntimeArtifact.owner_agent_name` 记录产物归属；上下文构建时，当前 Agent 自己的历史保持原生消息协议，其他 Agent 的连续历史作为 `Group Input` 注入当前任务上下文。
 
@@ -358,7 +360,7 @@ turtlemap/
 
 ## 当前边界与Roadmap
 
-当前已经完成状态持久化、上下文治理、异步任务回流、HITL、会话级多 Agent、handoff 控制权转移、流式消息截流与覆盖重放，以及全栈服务演示。以下能力仍在演进中：
+当前已经完成状态持久化、统一上下文模型与多 Agent、异步任务回流、HITL、handoff 控制权转移、流式消息截流与覆盖重放，以及全栈服务演示。以下能力仍在演进中：
 
 - 与任务无关的显式 takeover，以及更丰富的多 Agent 协作策略；
 - Planning、Resolve 与长任务分解；
@@ -366,4 +368,4 @@ turtlemap/
 - MCP 适配、分布式事件传输、执行调度与大规模运行验证；
 - 稳定公共 API、版本兼容策略和正式发布流程。
 
-TurtleMap不是低代码 Workflow 平台，也不以堆叠 Agent 模式为目标。后续仍将围绕服务端状态、可靠信息传递、会话级上下文、可恢复任务现场和长期运行能力演进。
+TurtleMap不是低代码 Workflow 平台，也不以堆叠 Agent 模式为目标。后续仍将围绕服务端状态、可靠信息传递、统一上下文模型、可恢复任务现场和长期运行能力演进。
