@@ -66,6 +66,7 @@ from turtlemap.kernel.tool import (
 )
 from turtlemap.os.models import ProcessingTask
 from turtlemap.os.tool.build_in.hitl import K_HITL_TOOL_ID_PREFIX, HitlTool
+from turtlemap.os.tool.build_in.handoff_return import K_TOOL_NAME_HANDOFF_RETURN
 from turtlemap.os.tool.build_in.resume_task import K_TOOL_NAME_RESUME_TASK
 from turtlemap.os.tool.enums import AsyncToolType
 from turtlemap.shared.ids import (
@@ -276,15 +277,15 @@ class ToolService(BaseToolService):
                 )
             )
 
-            # handoff 接管当前任务后，来源 Agent 不再执行同一消息中的后续工具调用。
-            if tool_execution_unit.is_handoff:
+            # handoff 接管或归还控制权后，来源 Agent 不再执行同一消息中的后续工具调用。
+            if tool_execution_unit.is_handoff or tool_execution_unit.is_handoff_return:
                 ignored_tool_call_count = (
                     len(assistant_message.tool_calls) - tool_call_index - 1
                 )
                 if ignored_tool_call_count > 0:
                     Logger.logger.warning(
-                        "handoff 工具调用后忽略同一 assistant 消息中的后续工具调用："
-                        f"handoff_tool_call_id={tool_call.id}，"
+                        "控制权变更工具调用后忽略同一 assistant 消息中的后续工具调用："
+                        f"tool_call_id={tool_call.id}，"
                         f"ignored_tool_call_count={ignored_tool_call_count}，"
                         f"agent_name={agent.agent_name}"
                     )
@@ -321,12 +322,14 @@ class ToolService(BaseToolService):
         self,
         owner_agent: BaseAgent,
         excution_unit: ExecutionUnit,
+        agent_name2agent: dict[str, BaseAgent],
     ) -> AgentFrameChange:
         """从 LLM 工具调用产物构建首个有效 handoff 状态。
 
         参数:
+            owner_agent: 发起当前 handoff 的来源 Agent。
             excution_unit: 当前 assistant 生成的工具调用 Runtime 产物。
-            session_state: 当前会话状态，预留给 handoff 运行期状态校验。
+            agent_name2agent: 当前 Runtime 已注册的 Agent 映射，用于读取对外展示名称。
 
         返回:
             包含目标 Agent 和 handoff artifact 的任务状态；消息不包含有效
@@ -342,12 +345,23 @@ class ToolService(BaseToolService):
         if not handoff_target:
             raise OSRuntimeError(f"handoff_target 不存在，agent: {owner_agent.agent_name}, tool_meta_id: {tool_execution_unit.tool_meta_id}")
 
+        from turtlemap.os.agent import Agent
+
+        source_agent = ensure_instance(owner_agent, Agent, "handoff 来源 Agent")
+        target_agent = ensure_instance(
+            agent_name2agent.get(handoff_target),
+            Agent,
+            "handoff 目标 Agent",
+        )
+
         return AgentFrameChange(
-                    target=handoff_target,
-                    source=owner_agent.agent_name,
-                    type=AgentFrameChangeType.PUSH,
-                    reason=AgentFrameChangeReason.HANDOFF,
-                )
+            target=handoff_target,
+            source=owner_agent.agent_name,
+            type=AgentFrameChangeType.PUSH,
+            reason=AgentFrameChangeReason.HANDOFF,
+            target_display_name=target_agent.name,
+            source_display_name=source_agent.name,
+        )
 
     def _filter_runtime_available_tools(
         self,
@@ -366,6 +380,7 @@ class ToolService(BaseToolService):
         说明:
             HITL 工具仅由 ToolService 在工具执行链中内部创建，不直接提供给 LLM。
             `resume_task` 仅在当前 Agent 存在暂停任务时可用，避免模型生成无目标的恢复调用。
+            `handoff_return` 仅在当前控制权栈存在父 Agent 时可用。
             handoff 目标已处于当前控制权栈时不再暴露，避免形成循环委派。
         """
 
@@ -388,6 +403,10 @@ class ToolService(BaseToolService):
 
             # 没有暂停任务时，恢复工具没有可处理的目标。
             if not has_paused_task and tool_id == K_TOOL_NAME_RESUME_TASK:
+                continue
+
+            # 根 Agent 没有父 frame，不能归还 handoff 控制权。
+            if len(session_state.agent_frames) == 1 and tool_id == K_TOOL_NAME_HANDOFF_RETURN:
                 continue
 
             # 已在控制权栈中的 Agent 不能再次作为 handoff 目标，避免循环委派。
@@ -497,7 +516,10 @@ class ToolService(BaseToolService):
                 function=function,
                 tool_input=tool_input,
             )
-            self._bind_tool_input_context(input_model)
+            self._bind_tool_input_context(
+                context=context,
+                input_model=input_model,
+            )
             self._run_before_execute_hooks(
                 execution_unit=execution_unit,
                 executable_tool=executable_tool,
@@ -609,8 +631,9 @@ class ToolService(BaseToolService):
         # tool loop continuation 由上下文构建器根据当前 task 展开已完成的工具执行产物。
         artifact = await self.os_service.generate_assistant_message_with_task(
             owner_agent=context.agent,
+            agent_name2agent=context.agent_name2agent,
             task=context.task,
-            no_tool_call=execution_unit.no_tool_call
+            no_tool_call=execution_unit.no_tool_call,
         )
         appended_execution_units: list[ExecutionUnit] = []
 
@@ -848,10 +871,15 @@ class ToolService(BaseToolService):
                 },
             ) from exc
 
-    def _bind_tool_input_context(self, input_model: BaseModel) -> None:
+    def _bind_tool_input_context(
+        self,
+        context: ToolExecutionContext,
+        input_model: BaseModel,
+    ) -> None:
         """把 os 层工具上下文绑定到已校验的工具输入模型。
 
         参数:
+            context: 当前工具调用对应的执行单元运行期上下文。
             input_model: 当前工具调用的输入模型实例。
 
         返回:
@@ -861,6 +889,7 @@ class ToolService(BaseToolService):
         ToolInputContext(
             event_bus_id=self.os_service.event_bus_id,
             tool_service=self,
+            tool_execution_context=context,
         ).bind_to_input_model(input_model)
 
     def _run_before_execute_hooks(
@@ -941,23 +970,14 @@ class ToolService(BaseToolService):
                 agent_frame_change = self._build_handoff_state(
                     owner_agent=context.agent,
                     excution_unit=execution_unit,
-                )
-
-                from turtlemap.os.agent import Agent
-
-                source_agent = ensure_instance(
-                    context.agent_name2agent.get(agent_frame_change.source),
-                    Agent,
-                    "handoff 来源 Agent",
-                )
-                target_agent = ensure_instance(
-                    context.agent_name2agent.get(agent_frame_change.target),
-                    Agent,
-                    "handoff 目标 Agent",
+                    agent_name2agent=context.agent_name2agent,
                 )
                 tool_result = ToolResult(
                     status=ToolResultStatus.SUCCESS,
-                    content=f"会话控制权将从 `{source_agent.name}` 转交给 `{target_agent.name}`",
+                    content=(
+                        f"会话控制权将从 `{agent_frame_change.source_display_name}` "
+                        f"转交给 `{agent_frame_change.target_display_name}`"
+                    ),
                     purpose="handoff",
                     raw_data={
                         K_RAW_DATA_HANDOFF: agent_frame_change

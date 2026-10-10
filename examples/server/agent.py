@@ -23,7 +23,8 @@ from turtlemap.kernel.models.enums import ToolResultStatus
 from turtlemap.kernel.tool import ToolDescriptor, ToolResult, tool
 from turtlemap.kernel.tool.models import AgentDescriptor
 from turtlemap.os.agent import Agent
-from turtlemap.os.context.models import SystemInstruction
+from turtlemap.os.context.models import SectionItem, SystemInstruction
+from turtlemap.os.context.prompt import build_bullet_list
 from turtlemap.os.tool.build_in.recollection import K_TOOL_NAME_RECOLLECTION
 from turtlemap.os.tool.model import ToolInputContext
 
@@ -129,7 +130,10 @@ async def query_weather(input_model: WeatherQueryInput) -> ToolResult:
         summary="获取用户当前位置。",
         capability_category="location",
         capability="获取用户当前的 mock 地理位置。",
-        use_cases=[],
+        use_cases=[
+            "用户询问当前位置时",
+            "用户的提问需要先获取当前位置时"
+        ],
         anti_use_cases=[],
     ),
     tool_id="get_current_location",
@@ -329,7 +333,7 @@ def build_agent(config: TurtleMapConfig) -> Agent:
             role="你是负责订单状态查询的售前客服。",
             objective="确认订单号后查询订单状态，并用清晰、自然的语言告知用户。",
             constraints=(
-                "- 仅处理订单状态查询；其他售后问题应说明当前处理范围。\n"
+                "- 仅处理订单状态查询；\n"
                 "- 在调用工具前建议先输出简短的思考（不超过50个字）避免直接调用工具，内容必须使用第二人称‘您’或‘你’直接称呼提问者，语言与用户输入一致。"
             ),
             input_format="用户会提供订单号，或询问订单、物流与配送进度。",
@@ -353,9 +357,20 @@ def build_agent(config: TurtleMapConfig) -> Agent:
             role="你是负责处理订单售后问题的客服。",
             objective="根据用户诉求登记反馈或退货问题，必要时协助转接人工客服。",
             constraints=(
-                "- 仅处理售后问题登记与人工服务请求；订单状态查询应说明当前处理范围。\n"
-                "- 在调用工具前建议先输出简短的思考（不超过50个字）避免直接调用工具，内容必须使用第二人称‘您’或‘你’直接称呼提问者，语言与用户输入一致。"
+                "- 仅处理售后问题登记与人工服务请求；\n"
+                "- 在调用工具前建议先输出简短的思考（不超过30个字）避免直接调用工具，内容必须使用第二人称‘您’或‘你’直接称呼提问者，语言与用户输入一致。\n"
+                "- 完成任务后无需主动追问用户其他需求"
             ),
+            custom_sections=[
+                SectionItem(
+                    header="工作要求",
+                    content=build_bullet_list(
+                        [
+                            "当用户咨询退货时，应当让用户提供订单号（必须）以及退货原因（除非用户拒绝提供，否则必须询问原因）"
+                        ]
+                    )
+                )
+            ],
             input_format="用户会提供订单号、问题类型或希望人工客服处理的订单问题。",
             output_format="回答语言与用户输入保持一致",
         ),
@@ -375,11 +390,11 @@ def build_agent(config: TurtleMapConfig) -> Agent:
         system=SystemInstruction(
             name="AI 助手",
             role="你是一个可靠的 AI 通用助手。",
-            objective="理解用户目标并将结果整理成自然、清晰的回答。",
+            objective="理解用户目标并正确调用工具分配任务。",
             constraints=(
                 "- 回答风格应当是拟人的，符合人类用语习惯，因此不要在回答中直接描述系统内部的工具调用、上下文检索或记忆读取等过程，"
                 f"推荐你可以换拟人的说法，我给你提供几个例子参考，但不需要照抄：'调用搜索工具'->'我查一下'，'调用{K_TOOL_NAME_RECOLLECTION}'->'我回忆一下'。\n"
-                "- 在调用工具前建议先输出简短的思考（不超过50个字）避免直接调用工具，内容必须使用第二人称‘您’或‘你’直接称呼提问者，语言与用户输入一致。"
+                "- 在调用工具前建议先输出简短的思考（不超过30个字）避免直接调用工具，内容必须使用第二人称‘您’或‘你’直接称呼提问者，语言与用户输入一致。\n"
             ),
             input_format="用户会用自然语言提出问题或任务。",
             output_format="回答语言与用户输入保持一致",

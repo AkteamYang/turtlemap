@@ -25,6 +25,8 @@ from turtlemap.kernel.models import RuntimeArtifact, RuntimeArtifactType
 from turtlemap.os.llm.model import LLMCompletionToolCall, LLMMessage
 from turtlemap.shared.typing import ensure_instance
 
+from .build_in.handoff_return import K_TOOL_NAME_HANDOFF_RETURN
+
 
 @ExecutionUnitResult.register_type
 class ToolCallExecutionResult(ExecutionUnitResult):
@@ -92,6 +94,19 @@ class ToolCallExecutionUnit(ExecutionUnit):
             and function.name
             and not self.tool_call.runtime_error_msg
             and function.name.startswith(K_HANDOFF_TOOL_ID_PREFIX)
+        )
+
+    @property
+    def is_handoff_return(self) -> bool:
+        """判断当前工具调用是否为 handoff 控制权归还工具。
+
+        返回:
+            当前工具元信息 id 是 `_handoff_return` 且调用未携带运行时错误时返回 `True`。
+        """
+
+        return (
+            self.tool_meta_id == K_TOOL_NAME_HANDOFF_RETURN
+            and not self.tool_call.runtime_error_msg
         )
 
 

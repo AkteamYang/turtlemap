@@ -19,6 +19,7 @@ from turtlemap.kernel.agent import BaseAgent
 from turtlemap.kernel.tool import AgentDescriptor, ExecutableTool
 from turtlemap.config import ContextTokenBudget, TurtleMapConfig
 from turtlemap.os.context.models import SystemInstruction
+from turtlemap.os.tool.build_in.handoff_return import HandoffReturnTool
 from turtlemap.os.tool.build_in.resume_task import ResumeTaskTool
 from turtlemap.shared.typing import ensure_instance
 
@@ -124,7 +125,7 @@ class Agent(BaseAgent):
         from turtlemap.os.tool.build_in import RecollectionTool
 
         # 系统级工具固定位于最前，业务 Agent 不需要显式声明。
-        system_tools = [RecollectionTool(), ResumeTaskTool()]
+        system_tools = [RecollectionTool(), ResumeTaskTool(), HandoffReturnTool()]
 
         # 复用 kernel 对系统工具、业务工具与 handoff 工具的统一装配。
         return ensure_instance(

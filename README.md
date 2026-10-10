@@ -14,7 +14,13 @@
 
 ## 运行演示
 
-![TurtleMap运行演示](docs/pic/Sep-11-2026%2013-31-20.gif)
+该演示展示流式输出、工具调用、中断恢复、自然语言确认与运行事件日志。
+
+![TurtleMap运行演示](docs/pic/tool_call.gif)
+
+该演示展示 handoff 控制权流转、跨 Agent 上下文延续，以及在话题转向或任务结束时归还控制权。
+
+![TurtleMap运行演示](docs/pic/handoff.gif)
 
 ## 项目定位
 
@@ -42,8 +48,7 @@ TurtleMap围绕以下原则演进：
 
 - 技术设计服务于真实问题，而不是概念堆砌；
 - 向人类处理事务的行为模式学习；
-- 以`Runtime`为组织核心，使模型、工具、状态与外部事件在统一运行语义下协作；
-- 可靠传达信息，区分事实、上下文、执行过程与面向用户的最终结果；
+- 可靠传达信息，充分理解执行；
 - 面向长期运行任务，保留可恢复的任务现场，而非只保存一次调用的文本结果。
 
 ## 核心能力
@@ -55,14 +60,12 @@ TurtleMap围绕以下原则演进：
 | Checkpoint / Resume | 通过状态序列化与StateStore保存稳定执行现场，支持中断后恢复 |
 | 可恢复异步Request/Response | 将HITL和后台任务回流统一抽象为任务挂起、响应关联与断点恢复 |
 | Tool Execution | Tool Schema、参数校验、同步/异步调用、统一ToolResult和系统工具注入 |
-| Human-in-the-loop | 根据工具元数据自动插入审批步骤，审批结果通过中断响应回流 |
 | Context Engineering | Token Budget、同步/后台压缩、历史折叠与压缩结果一致性合并 |
-| 会话级多 Agent | 共享会话 history/memory，按 Agent 视角投影上下文，支持 Group Input 与 handoff 控制权转移 |
-| Handoff | 将目标 Agent 暴露为控制权转移工具，支持 frame push/pop、原始输入重入队与基于继续标记的自动返回 |
+| 统一上下文感知 | 将多 Agent 消息、共享记忆、系统指令与外部插入信息统一纳入会话上下文，按当前 Agent 与任务视角投影，不受原生 LLM 消息格式限制 |
+| Handoff | 将目标 Agent 暴露为控制权转移工具，支持 frame push/pop、空 `HANDOFF` 输入唤起、继续标记保留与显式归还 |
 | Agent Memory | 长期/中期记忆管理、历史压缩和模型上下文注入 |
 | Event Bus / ResultCollector | 分发结构化Runtime事件，并从事件流聚合稳定运行结果 |
 | Agent Interceptor | 为输入与流式消息提供 AOP 扩展；支持截流、双通道内容修订、控制参数和 `IN_PROGRESS_PARTIAL` 覆盖重放 |
-| StateStore扩展 | 默认提供内存实现，并通过协议支持MySQL等外部持久化方案 |
 
 ## 总体架构
 
@@ -180,7 +183,7 @@ TurtleMap通过Token Budget控制模型上下文，在不同阈值下选择同�
 
 多 Agent 不维护彼此隔离的聊天副本。history 与 memory 归属于 Session，`RuntimeArtifact.owner_agent_name` 记录产物归属；上下文构建时，当前 Agent 自己的历史保持原生消息协议，其他 Agent 的连续历史作为 `Group Input` 注入当前任务上下文。
 
-`handoff` 是控制权栈转移，而不是一次返回结果的工具调用：来源 Agent 调用 handoff 工具后，Runtime push 目标 Agent frame，并将原始输入以 handoff 来源重新入队。目标 Agent 在最终消息中声明继续标记时保留控制权；否则 Runtime pop 当前 frame，回到直接父 Agent。
+`handoff` 是控制权栈转移，而不是一次返回结果的工具调用：来源 Agent 调用 handoff 工具后，Runtime push 目标 Agent frame，并以空的 handoff 输入唤起目标 Agent；目标 Agent 从 `Group Input` 接续共享会话。子 Agent 在最终消息中声明继续标记时保留控制权；未声明时 Runtime 自动 pop 回直接父 Agent 并等待下一次用户输入；当前问题超出子 Agent 范围时，可调用 `_handoff_return` 显式 pop 并立即唤起父 Agent 接续处理。
 
 这使多 Agent 会话既保持用户可感知的连续性，也不会把其他 Agent 的工具调用伪装成当前 Agent 的原生执行历史。
 
@@ -344,7 +347,7 @@ turtlemap/
 ### 多Agent与运行期扩展
 
 - [Handoff控制权转移](./docs/架构设计/5.0_Handoff控制权转移设计.md)
-- [会话级上下文与多Agent协作](./docs/架构设计/5.1_会话级上下文与多Agent协作设计.md)
+- [统一上下文模型](./docs/架构设计/5.1_统一上下文模型设计.md)
 - [Agent运行期拦截机制](./docs/架构设计/5.2_Agent运行期拦截机制设计.md)
 
 ### 状态与持久化

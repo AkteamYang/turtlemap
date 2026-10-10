@@ -468,6 +468,16 @@ button {
   line-height: 1.35;
 }
 
+.agent-name-pill-after-sales {
+  color: #2563eb;
+  background: #dbeafe;
+}
+
+.agent-name-pill-pre-sales {
+  color: #a16207;
+  background: #fef3c7;
+}
+
 .history-toggle {
   align-self: flex-start;
   margin-bottom: 4px;
@@ -1223,6 +1233,7 @@ button {
 }
 
 .detail-duration,
+.detail-ttft,
 .detail-status,
 .detail-input-event-type,
 .detail-tool-name,

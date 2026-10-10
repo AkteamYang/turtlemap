@@ -110,6 +110,7 @@ type DetailItem = {
   compressionLevel?: number;
   status?: string;
   durationMs?: number;
+  ttftDurationMs?: number;
   data: Record<string, unknown>;
 };
 
@@ -124,6 +125,12 @@ type ErrorFrameInfo = {
   message: string;
   data: Record<string, unknown>;
 };
+
+function getAgentNamePillClass(agentName: string): string {
+  if (agentName === "售后客服") return "agent-name-pill agent-name-pill-after-sales";
+  if (agentName === "售前客服") return "agent-name-pill agent-name-pill-pre-sales";
+  return "agent-name-pill";
+}
 
 export function App() {
   const [userInfo, setUserInfo] = useState<UserInfo | null>(null);
@@ -995,7 +1002,7 @@ function ChatLoadingState({ label }: { label: string }) {
 function EmptyChat({ onPrompt }: { onPrompt: (value: string) => void }) {
   const prompts = new Map([
     ["演示一次带工具调用的回答", "我现在的位置"],
-    ["演示一次售后流程", "这个产品我不想要了"],
+    ["演示一次售后流程", "帮我退货"],
     ["解释会话恢复和 SSE 续接逻辑", "解释会话恢复和 SSE 续接逻辑"],
   ]);
   return (
@@ -1066,7 +1073,7 @@ function TaskItemView({
       <div className="message-body">
         {showAgentName && presentation.agentName && (
           <div className="agent-label">
-            <span className="agent-name-pill">{presentation.agentName}</span>
+            <span className={getAgentNamePillClass(presentation.agentName)}>{presentation.agentName}</span>
           </div>
         )}
         {historyCount > 0 && (
@@ -1404,6 +1411,9 @@ function DetailItemView({
       {item.durationMs !== undefined && (
         <span className="detail-duration">{formatDuration(item.durationMs)}</span>
       )}
+      {item.ttftDurationMs !== undefined && (
+        <span className="detail-ttft">TTFT {formatDuration(item.ttftDurationMs)}</span>
+      )}
     </>
   );
 
@@ -1489,7 +1499,10 @@ function buildDetailSelection(item: ChatItem, block: ChatMessageBlock): DetailSe
     block,
   };
   const rawItems = isCompleteDetail
-    ? item.events.map((event) => buildDetailItem(event.type, serverEventToDetailData(event)))
+    ? item.events.map((event, index) => ({
+      ...buildDetailItem(event.type, serverEventToDetailData(event)),
+      ttftDurationMs: getMessageDeltaTtftDurationMs(item.events, index),
+    }))
     : getDetailItems(block, fallbackData);
   const items = rawItems.map((detailItem) => ({
     ...detailItem,
@@ -1536,6 +1549,23 @@ function getDurationMs(data: Record<string, unknown>): number | undefined {
 
   const durationMs = (payload as Record<string, unknown>).duration_ms;
   return typeof durationMs === "number" && Number.isFinite(durationMs) ? durationMs : undefined;
+}
+
+function getMessageDeltaTtftDurationMs(
+  events: ServerMessageEvent[],
+  eventIndex: number,
+): number | undefined {
+  const event = events[eventIndex];
+  const previousEvent = events[eventIndex - 1];
+  if (
+    event?.type !== "message_delta"
+    || (previousEvent?.type !== "input" && previousEvent?.type !== "tool_result")
+  ) {
+    return undefined;
+  }
+
+  const durationMs = event.start_ts_ms - previousEvent.start_ts_ms;
+  return Number.isFinite(durationMs) && durationMs >= 0 ? durationMs : undefined;
 }
 
 function getDetailItems(

@@ -31,11 +31,12 @@ from turtlemap.kernel.tool import (
     ToolDescriptor,
 )
 from turtlemap.kernel.tool.models import RESERVED_UNIT_TYPE_LLM_CALL
+from turtlemap.os.agent import Agent
 from turtlemap.os.context.models import (
     ContextBuildInput,
     ContextBuildResult,
     ContextCompressionLevel,
-    ContextProjection,
+    ContextSource,
     SystemInstruction,
 )
 from turtlemap.os.exceptions import OSRuntimeError
@@ -296,9 +297,9 @@ class ContextBuildProvider(ContextBuildProtocol):
             已完成消息拼装、工具 schema 拼装和 token 统计的上下文草稿。
         """
 
-        projection = self._build_context_projection(build_input)
-        messages = self.projector.build_messages_from_projection(projection)
-        tool_schemas = self._build_tool_schemas(projection.tools)
+        context_source = self._build_context_source(build_input)
+        messages = self.projector.build_messages_from_source(context_source)
+        tool_schemas = self._build_tool_schemas(context_source.tools)
         total_tokens = self.tokenizer.count_context(
             messages=messages,
             tool_schemas=tool_schemas,
@@ -309,36 +310,49 @@ class ContextBuildProvider(ContextBuildProtocol):
             total_tokens=total_tokens,
         )
 
-    def _build_context_projection(
+    def _build_context_source(
         self,
         build_input: ContextBuildInput,
-    ) -> ContextProjection:
-        """构建上下文原始数据投影。
+    ) -> ContextSource:
+        """汇集一次上下文构建所需的完整原材料。
 
         参数:
             build_input: 当前轮上下文构建所需的标准输入对象。
 
         返回:
-            尚未展开为最终 LLM messages 的上下文投影对象。
+            尚未展开为最终 LLM messages 的上下文原材料。
         """        
         # history
         history = list(build_input.session_state.history)
 
         # system
         is_subagent = len(build_input.session_state.agent_frames) > 1
-        history_agent_names = {
+        agent_name2display_name = {
+            agent_name: ensure_instance(agent, Agent).name
+            for agent_name, agent in build_input.agent_name2agent.items()
+        }
+        group_chat_agent_names = {
             artifact.owner_agent_name
             for artifact in history
             if artifact.owner_agent_name
         }
-        is_multi_agent = len(history_agent_names) > 1
+        if build_input.owner_agent.agent_name:
+            group_chat_agent_names.add(build_input.owner_agent.agent_name)
+        is_group_chat = len(group_chat_agent_names) > 1
+
+        # 可接管 Agent 必须是本轮实际暴露给模型的 handoff 工具，不能依据静态配置判断。
+        has_handoff = any(
+            tool.tool_metadata.is_handoff
+            for tool in build_input.available_tools
+        )
         system_message = self.projector._build_system_llm_message(
             system=ensure_instance(
                 build_input.owner_agent_state.system,
                 SystemInstruction,
             ),
             is_subagent=is_subagent,
-            is_multi_agent=is_multi_agent,
+            is_group_chat=is_group_chat,
+            has_handoff=has_handoff,
         )
 
         # memory
@@ -351,7 +365,7 @@ class ContextBuildProvider(ContextBuildProtocol):
         task_artifacts: list[RuntimeArtifact] = []
         if build_input.task.start_input is None:
             raise OSRuntimeError(
-                f"构建上下文投影时缺少 start_input, task_id={build_input.task.task_id}"
+                f"构建上下文原材料时缺少 start_input, task_id={build_input.task.task_id}"
             )
 
         # current_input 保留原始 Input，后续消息展开时再选择 LLM 可读模板。
@@ -363,11 +377,12 @@ class ContextBuildProvider(ContextBuildProtocol):
             exclude_start_input=True,  # 排除start_input，由current_input专门构建
         )
 
-        projection = ContextProjection(
+        context_source = ContextSource(
             system_message=system_message,
             is_subagent=is_subagent,
             owner_agent_name=build_input.owner_agent.agent_name,
-            is_multi_agent=is_multi_agent,
+            agent_name2display_name=agent_name2display_name,
+            is_group_chat=is_group_chat,
             memory_message=memory_message,
             history=history,
             current_input=current_input,
@@ -379,25 +394,24 @@ class ContextBuildProvider(ContextBuildProtocol):
             ],
             tools=list(build_input.available_tools),
         )
-        projection = self._modify_context_projection(projection)
-        return projection
+        return self._modify_context_source(context_source)
 
-    def _modify_context_projection(
-        self, projection: ContextProjection
-    ) -> ContextProjection:
-        """按当前可用工具集合修正上下文投影。
+    def _modify_context_source(
+        self, context_source: ContextSource
+    ) -> ContextSource:
+        """按当前可用工具集合修正上下文原材料。
 
         参数:
-            projection: 初始上下文投影对象。
+            context_source: 初始上下文原材料。
 
         返回:
-            已过滤不可用工具历史轮次后的上下文投影对象。
+            已过滤不可用工具历史轮次后的上下文原材料。
 
         说明:
             history 中的 tool call 必须能被当前轮可用工具集合解释；否则该轮
             旧 history 在当前上下文中无法稳定复现，整轮过滤掉。
         """
-        return projection
+        return context_source
 
 
     def _should_schedule_sync_compression(

@@ -227,6 +227,7 @@ class OSService:
     async def generate_assistant_message_with_task(
         self,
         owner_agent: BaseAgent,
+        agent_name2agent: dict[str, BaseAgent],
         task: BaseProcessingTask,
         no_tool_call: bool = False,
     ) -> RuntimeArtifact:
@@ -234,6 +235,7 @@ class OSService:
 
         参数:
             owner_agent: 当前拥有控制权的 Agent。
+            agent_name2agent: 当前会话可达 Agent 的稳定名称到运行时对象映射。
             task: 当前正在生成 assistant 消息的任务现场。
             no_tool_call: 是否禁用当前轮工具调用；工具异常后的兜底生成会开启该选项。
 
@@ -276,6 +278,7 @@ class OSService:
             owner_agent=effective_owner_agent,
             owner_agent_state=owner_state,
             task=task,
+            agent_name2agent=agent_name2agent,
             event_bus_id=self.event_bus_id,
             available_tools=available_executable_tools,
         )

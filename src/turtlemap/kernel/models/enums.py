@@ -148,6 +148,9 @@ class RuntimeArtifactType(str, Enum):
     # 工具执行后 continuation LLM 生成产物，对应 payload 为 LLMCallExecutionUnit。
     TOOL_LLM_RESPONSE = "tool_llm_response"
 
+    # Agent 控制权栈变更产物，对应 payload 为 BaseAgentFrameChange。
+    AGENT_FRAME_CHANGE = "agent_frame_change"
+
     # 任务暂停中断请求产物，对应 payload 为 InterruptionRequest。
     INTERRUPTION_REQUEST = "interruption_request"
 
@@ -203,3 +206,6 @@ class AgentFrameChangeReason(str, Enum):
 
     # 当前 handoff 任务结束并返回来源 Agent。
     HANDOFF_RETURN = "handoff_return"
+
+    # 当前 handoff 任务结束并返回来源 Agent 继续执行。
+    HANDOFF_RETURN_TOOL = "handoff_return_tool"

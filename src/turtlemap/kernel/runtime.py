@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from turtlemap.kernel.models.enums import AgentFrameChangeType, EventSource, RuntimeArtifactType
+from turtlemap.kernel.models.enums import AgentFrameChangeReason, AgentFrameChangeType, EventSource, RuntimeArtifactType
 from turtlemap.kernel.models.models import AgentFrame, BaseAgentFrameChange
 from turtlemap.shared.typing import ensure_instance
 
@@ -916,6 +916,7 @@ class BaseRuntime:
                 f"top_frame={self.session_state.agent_frames[-1].agent_name}"
             )
 
+        should_run = False
         if frame_change.type == AgentFrameChangeType.PUSH:
             self.session_state.agent_frames.append(
                 AgentFrame(
@@ -923,8 +924,16 @@ class BaseRuntime:
                     from_agent_name=self.session_state.agent_frames[-1].agent_name,
                 )
             )
+            should_run = True
+        elif frame_change.type == AgentFrameChangeType.POP:
+            self.session_state.agent_frames.pop()
+            if frame_change.reason == AgentFrameChangeReason.HANDOFF_RETURN_TOOL:
+                should_run = True
+        else:
+            raise KernelRuntimeError(f"不支持的 frame_change.type：{frame_change.type}")
 
-            # handoff 只重新触发目标 Agent，不重复投递用户原始文本。
+        # handoff 只重新触发目标 Agent，不重复投递用户原始文本。
+        if should_run:
             source_input = task.start_input
             if source_input:
                 await self._push_input(
@@ -943,10 +952,6 @@ class BaseRuntime:
                         ],
                     )
                 )
-        elif frame_change.type == AgentFrameChangeType.POP:
-            self.session_state.agent_frames.pop()
-        else:
-            raise KernelRuntimeError(f"不支持的 frame_change.type：{frame_change.type}")
 
         # 通知 frame change 完成
         await self._override_service_agent_frame_did_change(

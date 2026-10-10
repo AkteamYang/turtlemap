@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel
 
 from turtlemap.kernel.models.enums import RuntimeArtifactType
+from turtlemap.kernel.tool.models import ToolExecutionContext
 from turtlemap.kernel.models.models import BaseAgentFrameChange, RuntimeArtifact
 from turtlemap.kernel.models.polymorphic import BaseStateModel
 from turtlemap.os.llm.model import LLMCompletionToolCall, LLMMessage
@@ -36,6 +37,7 @@ class ToolInputContext:
     属性:
         event_bus_id: 当前工具调用所属的事件通道标识。
         tool_service: 当前工具调用所属的 ToolService，可用于读取 os 层上下文。
+        tool_execution_context: 当前工具调用对应的执行单元运行期上下文。
 
     说明:
         该上下文通过私有属性挂到工具输入模型上，避免污染工具参数 schema。
@@ -46,6 +48,9 @@ class ToolInputContext:
 
     # 当前工具调用所属的 ToolService，供内置工具读取运行期上下文。
     tool_service: "ToolService | None" = None
+
+    # 当前工具调用对应的执行单元运行期上下文。
+    tool_execution_context: ToolExecutionContext | None = None
 
     def bind_to_input_model(self, input_model: BaseModel) -> None:
         """将当前工具上下文绑定到已反序列化的输入模型。
@@ -72,6 +77,11 @@ class ToolInputContext:
 
         return getattr(input_model, ATTR_TOOL_INPUT_CONTEXT, None)
 
+
+@RuntimeArtifact.register_field_type(
+    "payload",
+    RuntimeArtifactType.AGENT_FRAME_CHANGE,
+)
 class AgentFrameChange(BaseAgentFrameChange):
     """表示一次 Agent 控制权栈变更的稳定产物。
 
@@ -79,4 +89,9 @@ class AgentFrameChange(BaseAgentFrameChange):
         `type` 描述控制权栈的 push 或 pop 动作，`reason` 描述触发该动作的
         业务语义。该产物同时作为任务状态与 event bus 通知的共享载荷。
     """
-    ...
+
+    # 目标 Agent 的对外展示名称。
+    target_display_name: str = ""
+
+    # 来源 Agent 的对外展示名称。
+    source_display_name: str = ""

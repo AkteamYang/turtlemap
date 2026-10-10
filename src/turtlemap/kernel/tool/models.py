@@ -49,7 +49,7 @@ K_RAW_DATA_HANDOFF = "_raw_data_handoff"
 
 
 # handoff 转换为工具时使用的稳定工具 id 前缀。
-K_HANDOFF_TOOL_ID_PREFIX = "_handoff_"
+K_HANDOFF_TOOL_ID_PREFIX = "_handoff_agent_"
 
 
 class ToolFactSourceType(str, Enum):

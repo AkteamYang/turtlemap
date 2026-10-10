@@ -29,6 +29,7 @@ from turtlemap.kernel.models import (
 from turtlemap.kernel.tool.models import JsonDict
 
 if TYPE_CHECKING:
+    from turtlemap.kernel.agent import BaseAgent
     from turtlemap.kernel.tool import ExecutableTool
     from turtlemap.os.agent import Agent
     from turtlemap.os.llm.model import LLMMessage
@@ -37,6 +38,27 @@ if TYPE_CHECKING:
 
 K_FRAMEWORK_INSTRUCTION = "Framework Instructions"
 K_AGENT_DEFINITION = "Agent Definition"
+
+
+class SectionItem(BaseModel):
+    """表示业务注入 Agent 系统提示词的一个自定义章节。
+
+    说明:
+        该模型只描述章节展示结构。`SystemInstruction` 在固定业务定义章节之后
+        按声明顺序渲染这些对象，供业务补充领域规则、流程说明或协议约定。
+    """
+
+    # 当前自定义章节的标题。
+    header: str
+
+    # 当前自定义章节的 Markdown 标题层级，默认为二级标题。
+    level: int = 2
+
+    # 当前章节中位于正文前的简要说明。
+    description: str = ""
+
+    # 当前章节的业务正文，允许使用 Markdown。
+    content: str = ""
 
 
 @SystemDefinition.register_type
@@ -55,10 +77,13 @@ class SystemInstruction(SystemDefinition):
     title: str = K_AGENT_DEFINITION
 
     # 系统定义的整体说明文本。
-    description: str = "本次任务对应提示词"
+    description: str = "以下为当前业务对应的 Agent 系统提示词。"
 
     # 面向用户与其他 Agent 展示的名称，不等同于运行期稳定 agent_name。
     name: str = ""
+
+    # 业务按需追加的自定义章节，渲染时固定置于 Constraints 之后。
+    custom_sections: list[SectionItem] = Field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -90,6 +115,12 @@ class FrameworkInstruction:
 
     # 框架规则中关于最终输出结构的统一说明。
     output_format: str = ""
+
+    # 框架规则中关于 handoff 输出与控制权归还的统一说明。
+    handoff_control: str = ""
+
+    # 已构建的框架规则示例文本，用于补充输出与控制协议的典型情形。
+    examples: str = ""
 
     # 框架规则中关于事实来源采用策略的统一说明。
     fact_sources: str = ""
@@ -278,8 +309,11 @@ class HistoryRoundGroup:
     # 当前分组在投影流程中的处理类型。
     type: HistoryRoundGroupType
 
-    # 连续历史轮次所属的 Agent 名称。
+    # 连续历史轮次所属的 Agent 稳定名称，用于分组关联，不直接投影给模型。
     owner_agent_name: str
+
+    # 连续历史轮次所属 Agent 的对外展示名称，仅用于投影给模型的来源标识。
+    owner_agent_display_name: str
 
     # 按原始会话顺序保存的历史轮次。
     history_round_group: list[list[RuntimeArtifact]]
@@ -309,6 +343,9 @@ class ContextBuildInput:
     # 当前正在构建上下文的任务现场
     task: BaseProcessingTask
 
+    # 当前 Runtime 可达 Agent 的稳定名称到 Agent 对象映射。
+    agent_name2agent: dict[str, "BaseAgent"] = field(default_factory=dict)
+
     # 当前 Runtime 绑定的事件通道标识，供压缩等上下文治理流程发布运行事件。
     event_bus_id: str = ""
 
@@ -317,12 +354,13 @@ class ContextBuildInput:
 
 
 @dataclass(slots=True)
-class ContextProjection:
-    """表示上下文构建过程中的原始数据投影。
+class ContextSource:
+    """表示一次上下文构建的完整原材料。
 
     说明:
-        投影对象保存进入上下文构建的直接数据，而不是最终 LLM messages。
-        这样后续插件层可以在消息展开前检查、改写或观测上下文组成。
+        该对象保存系统定义、记忆、历史、当前任务和工具等原始材料，而不是最终
+        LLM messages。`ContextProjector` 以此为输入执行消息层投影，后续插件层也可
+        在展开前检查、改写或观测上下文组成。
     """
 
     # 当前 Agent 的 system 消息；系统定义为空时允许不存在。
@@ -334,8 +372,11 @@ class ContextProjection:
     # 当前构建上下文的 Agent 名称，用于按所属视角投影 history。
     owner_agent_name: str = ""
 
-    # 当前会话上下文是否涉及多个 Agent。
-    is_multi_agent: bool = False
+    # 可达 Agent 的稳定名称到展示名称映射，供跨 Agent history 投影使用。
+    agent_name2display_name: dict[str, str] = field(default_factory=dict)
+
+    # 当前会话是否包含当前 Agent 之外的其他 Agent。
+    is_group_chat: bool = False
 
     # 当前 Agent 的 memory 消息；长期和中期记忆都为空时允许不存在。
     memory_message: LLMMessage | None = None

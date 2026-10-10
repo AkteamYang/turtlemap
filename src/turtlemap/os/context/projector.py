@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from html import escape
 
 from turtlemap.kernel.models import (
+    EventSource,
     EventType,
     MessageRole,
     RuntimeArtifact,
@@ -22,12 +23,13 @@ from turtlemap.kernel.models import (
     ToolResultStatus,
     UserInputPayload,
 )
+from turtlemap.kernel.models.enums import AgentFrameChangeReason, AgentFrameChangeType
 from turtlemap.kernel.models.models import BaseSessionState, Input, InterruptionRequest, ObservableEvent
 from turtlemap.kernel.tool import ExecutionUnit, ToolFactSourceType, ToolResult
 from turtlemap.kernel.tool.models import RESERVED_UNIT_TYPE_LLM_CALL, RESERVED_UNIT_TYPE_TOOL_CALL
 from turtlemap.os.context.models import (
     K_FRAMEWORK_INSTRUCTION,
-    ContextProjection,
+    ContextSource,
     HistoryRoundGroup,
     HistoryRoundGroupType,
     SystemInstruction,
@@ -36,17 +38,20 @@ from turtlemap.os.context.models import (
 )
 from turtlemap.os.exceptions import OSRuntimeError
 from turtlemap.os.llm.model import LLMMessage
+from turtlemap.os.tool.build_in.handoff_return import K_TOOL_NAME_HANDOFF_RETURN
 from turtlemap.os.tool.build_in.resume_task import K_TOOL_NAME_RESUME_TASK
 from turtlemap.shared.logger import Logger
 from turtlemap.shared.typing import ensure_instance
 
 from ..tool import LLMCallExecutionResult, LLMCallExecutionUnit, ToolCallExecutionResult, ToolCallExecutionUnit
+from ..tool.model import AgentFrameChange
 from .prompt import (
     K_CURRENT_ENVIRONMENT,
     K_CONTINUE_MARKER,
     K_EXTERNAL_REAL_TIME_DATA,
     K_GROUP_INPUT,
     K_GROUP_INPUT_LABEL,
+    K_HANDOFF_CONTROL,
     K_MEMORY_CONTEXT,
     K_OUTPUT_FORMAT,
     K_RECOLLECTION,
@@ -60,7 +65,7 @@ from .prompt import (
 )
 
 class ContextProjector:
-    """将结构化 ContextProjection 展开为模型可消费的消息序列。
+    """将结构化 ContextSource 投影为模型可消费的消息序列。
 
     说明:
         该类只负责消息层投影：系统定义、共享记忆、历史轮次、跨 Agent Group Input、
@@ -70,54 +75,56 @@ class ContextProjector:
 
     _default_empty_tool_result_content = "工具执行结果为空。"
 
-    def build_messages_from_projection(
+    def build_messages_from_source(
         self,
-        projection: ContextProjection,
+        context_source: ContextSource,
     ) -> list[LLMMessage]:
-        """将上下文投影按运行顺序展开为最终 LLM 消息。
+        """将上下文原材料按运行顺序投影为最终 LLM 消息。
 
         参数:
-            projection: 已收集系统、记忆、历史、当前任务和工具信息的上下文投影。
+            context_source: 已收集系统、记忆、历史、当前任务和工具信息的上下文原材料。
 
         返回:
             按 system、memory、history、current input、任务过程产物排序的消息列表。
         """
 
         messages: list[LLMMessage] = []
-        if projection.system_message is not None:
-            messages.append(projection.system_message)
-        if projection.memory_message is not None:
-            messages.append(projection.memory_message)
+        if context_source.system_message is not None:
+            messages.append(context_source.system_message)
+        if context_source.memory_message is not None:
+            messages.append(context_source.memory_message)
 
         available_tool_names = {
-            tool.tool_metadata.id for tool in projection.tools
+            tool.tool_metadata.id for tool in context_source.tools
         }
 
         # 历史投影会将末尾尚未被 normal 历史消费的 Group Input 返回给当前任务输入。
         history_messages, current_input_group_input = self._build_history_llm_messages(
-            history=projection.history,
+            history=context_source.history,
             available_tool_names=available_tool_names,
-            current_agent_name=projection.owner_agent_name,
+            current_agent_name=context_source.owner_agent_name,
+            agent_name2display_name=context_source.agent_name2display_name,
             excluded_input_id=(
-                projection.current_input.input_id
-                if projection.current_input is not None
+                context_source.current_input.input_id
+                if context_source.current_input is not None
                 else None
             ),
         )
         messages.extend(history_messages)
 
-        if projection.current_input is not None:
+        if context_source.current_input is not None:
 
             # handoff 后当前 Agent 的首轮任务在这里接收前序 Agent 留下的外部会话信息。
             messages.append(
                 self._build_current_input_llm_message(
-                    current_input=projection.current_input,
-                    is_subagent=projection.is_subagent,
+                    current_input=context_source.current_input,
+                    is_subagent=context_source.is_subagent,
                     group_input=current_input_group_input,
                 )
             )
 
-        for task_artifact in projection.task_artifacts:
+        # 当前任务已完成的部分产物
+        for task_artifact in context_source.task_artifacts:
             messages.extend(self._artifact_to_llm_messages(task_artifact))
         return messages
 
@@ -125,16 +132,12 @@ class ContextProjector:
         self,
         history: list[RuntimeArtifact],
         available_tool_names: set[str],
-        current_agent_name: str | None = None,
-        excluded_input_id: str | None = None,
     ) -> list[LLMMessage]:
         """按轮次治理 history，并按 Agent 视角投影为 LLM 消息。
 
         参数:
             history: 会话级原始历史产物。
             available_tool_names: 当前 Agent 可调用的工具 id 集合。
-            current_agent_name: 当前投影视角所属 Agent；为空时保留原生消息，用于摘要。
-            excluded_input_id: 已作为当前任务输入单独投影的输入 id。
 
         返回:
             经过去重、工具治理与 Agent 视角转换后的 LLM 消息。
@@ -147,8 +150,7 @@ class ContextProjector:
         messages, _ = self._build_history_llm_messages(
             history=history,
             available_tool_names=available_tool_names,
-            current_agent_name=current_agent_name,
-            excluded_input_id=excluded_input_id,
+            agent_name2display_name={},
         )
         return messages
 
@@ -156,15 +158,27 @@ class ContextProjector:
         self,
         system: SystemInstruction,
         is_subagent: bool,
-        is_multi_agent: bool,
+        is_group_chat: bool,
+        has_handoff: bool,
     ) -> LLMMessage | None:
-        """将结构化系统定义构建为当前 Agent 的 system 消息。"""
+        """将结构化系统定义构建为当前 Agent 的 system 消息。
+
+        参数:
+            system: 当前 Agent 的结构化系统定义。
+            is_subagent: 当前 Agent 是否处于嵌套控制权栈。
+            is_group_chat: 当前会话是否存在其他 Agent 的历史。
+            has_handoff: 当前轮是否提供可接管会话的 handoff 工具。
+
+        返回:
+            已包含框架规则与业务定义的 system 消息；没有有效内容时返回 None。
+        """
 
         content = build_system_definition_prompt(
             system,
             framework_instruction=build_framework_instruction(
                 is_subagent=is_subagent,
-                is_multi_agent=is_multi_agent,
+                is_group_chat=is_group_chat,
+                has_handoff=has_handoff,
             ),
         )
         if not content:
@@ -258,17 +272,19 @@ class ContextProjector:
         current_time = datetime.now().astimezone()
         constraints: list[str] = []
         if is_subagent:
-            constraints.append(
-                f"请根据 `{K_OUTPUT_FORMAT}` 中关于 `{K_CONTINUE_MARKER}` 的具体要求在最终输出末尾添加标记；"
+            constraints.extend(
+                [
+                    f"如果用户输入问题超出你的能力范围，请使用 `{K_TOOL_NAME_HANDOFF_RETURN}` 工具，并且工具的前置输出内容固定为 `好的`。\n",
+                    f"请根据 `{K_HANDOFF_CONTROL}` 要求正确处理 `{K_CONTINUE_MARKER}` 标记；",
+                ]
             )
             if group_input:
                 constraints.append(
-                    f"请从 `{K_GROUP_INPUT}` 中了解最新用户输入，`{K_USER_INPUT}` 中留空不重复输入；"
+                    f"当前是处理 handoff 委派任务，所以当前用户输入留空，请结合 `{K_GROUP_INPUT}` 延续既有对话，开场避免重复寒暄和复述；"
                 )
         current_environment = build_bullet_list(
             [
-                f"当前时间：{current_time:%Y年%m月%d日 %H:%M:%S %Z}",
-                f"当前 Unix 时间戳：{int(current_time.timestamp())}",
+                f"当前时间：{current_time:%Y年%m月%d日 %H:%M:%S %Z}(Unix 时间戳：{int(current_time.timestamp())})",
             ]
         )
         context_items: list[TaskInputContextItem] = []
@@ -366,8 +382,9 @@ class ContextProjector:
         self,
         history: list[RuntimeArtifact],
         available_tool_names: set[str],
-        current_agent_name: str | None,
-        excluded_input_id: str | None,
+        agent_name2display_name: dict[str, str],
+        current_agent_name: str | None = None,
+        excluded_input_id: str | None = None,
     ) -> tuple[list[LLMMessage], list[str]]:
         """按 Agent 视角治理历史，并构建消息及当前输入待消费的 Group Input。
 
@@ -375,6 +392,7 @@ class ContextProjector:
             history: 会话级原始历史产物。
             available_tool_names: 当前 Agent 可调用的工具 id 集合。
             current_agent_name: 当前投影视角所属 Agent；为空时不生成 Group Input。
+            agent_name2display_name: Agent 稳定名称到对外展示名称的映射。
             excluded_input_id: 已作为当前任务输入单独构建的输入 id。
 
         返回:
@@ -397,6 +415,7 @@ class ContextProjector:
         history_round_groups = self._build_history_round_groups(
             history_rounds=filtered_history_rounds,
             current_agent_name=current_agent_name,
+            agent_name2display_name=agent_name2display_name,
         )
 
         # Group Input 只会转交给时间上紧邻的 normal 分组，末尾残留则由当前任务接收。
@@ -431,12 +450,14 @@ class ContextProjector:
     def _build_history_round_groups(
         history_rounds: list[list[RuntimeArtifact]],
         current_agent_name: str | None,
+        agent_name2display_name: dict[str, str],
     ) -> list[HistoryRoundGroup]:
         """按连续 owner Agent 划分普通历史与待转交的 Group Input 分组。
 
         参数:
             history_rounds: 已完成输入去重的历史轮次。
             current_agent_name: 当前投影视角所属 Agent；为空时所有分组均为 normal。
+            agent_name2display_name: Agent 稳定名称到对外展示名称的映射。
 
         返回:
             保持会话顺序的历史轮次分组。
@@ -450,6 +471,7 @@ class ContextProjector:
         for history_round in history_rounds:
             if not history_round:
                 continue
+
             owner_agent_name = history_round[0].owner_agent_name
             group_type = (
                 HistoryRoundGroupType.NORMAL
@@ -465,10 +487,16 @@ class ContextProjector:
                 # 仅连续且同属一个 Agent 的轮次能够共享同一段 Group Input 接收语境。
                 history_round_groups[-1].history_round_group.append(history_round)
                 continue
+
+            owner_agent_display_name = agent_name2display_name.get(
+                owner_agent_name,
+                owner_agent_name,
+            )
             history_round_groups.append(
                 HistoryRoundGroup(
                     type=group_type,
                     owner_agent_name=owner_agent_name,
+                    owner_agent_display_name=owner_agent_display_name,
                     history_round_group=[history_round],
                 )
             )
@@ -557,6 +585,7 @@ class ContextProjector:
                         )
                     )
                     break
+
             final_assistant_message = self._get_last_tool_llm_response_message(history_round)
             if final_assistant_message is not None:
                 messages.append(final_assistant_message)
@@ -572,6 +601,7 @@ class ContextProjector:
                     )
                 )
                 continue
+
             messages.extend(self._artifact_to_llm_messages(artifact))
         return messages
 
@@ -648,24 +678,82 @@ class ContextProjector:
             此阶段只收敛跨 Agent 消息，不创建独立 LLM user role。Group Input 中的
             tool_call 已转为 XML 背景信息，不会作为当前 Agent 的原生工具调用回放，
             因此不按当前工具集合折叠。外层标签由接收方 normal 分组的 TaskInput Context
-            统一构建。
+            统一构建。handoff 创建的空输入只用于唤起目标 Agent，不投影为跨 Agent 信息。
         """
 
-        messages: list[LLMMessage] = []
+        elements: list[str] = []
         for history_round in history_round_group.history_round_group:
             for artifact in history_round:
-                messages.extend(self._artifact_to_llm_messages(artifact))
 
-        # 外部 Agent 的原始消息转换为不携带 LLM role 的 Group Input XML 元素。
-        elements: list[str] = []
-        for message in messages:
-            message_elements = self._llm_message_to_group_input_elements(
-                message,
-                history_round_group.owner_agent_name,
-            )
+                # handoff 空输入只是 Runtime 调度信号，不应成为其他 Agent 的用户消息背景。
+                if artifact.type == RuntimeArtifactType.INPUT:
+                    input_payload = ensure_instance(
+                        artifact.payload,
+                        Input,
+                        "Group Input 输入产物",
+                    )
+                    if (
+                        input_payload.events
+                        and input_payload.events[0].source == EventSource.HANDOFF
+                    ):
+                        continue
 
-            elements.extend(message_elements)
+                if artifact.type == RuntimeArtifactType.AGENT_FRAME_CHANGE:
+
+                    # 控制权事件对其他 Agent 是协作背景，需通过 Group Input 感知当前会话归属。
+                    elements.append(
+                        self._agent_frame_change_to_group_input_element(
+                            agent_frame_change=ensure_instance(
+                                artifact.payload,
+                                AgentFrameChange,
+                                "Group Input 控制权变更产物",
+                            ),
+                            owner_agent_display_name=(
+                                history_round_group.owner_agent_display_name
+                            ),
+                        )
+                    )
+                    continue
+
+                # 外部 Agent 的原始消息转换为不携带 LLM role 的 Group Input XML 元素。
+                for message in self._artifact_to_llm_messages(artifact):
+                    elements.extend(
+                        self._llm_message_to_group_input_elements(
+                            message,
+                            history_round_group.owner_agent_display_name,
+                        )
+                    )
         return "\n\n".join(elements)
+
+    @staticmethod
+    def _agent_frame_change_to_group_input_element(
+        agent_frame_change: AgentFrameChange,
+        owner_agent_display_name: str,
+    ) -> str:
+        """将控制权变更产物转换为 Group Input 中的自然语言消息。
+
+        参数:
+            agent_frame_change: 当前需让接收 Agent 感知的控制权变更。
+            owner_agent_display_name: 触发控制权变更的 Agent 对外展示名称。
+
+        返回:
+            带来源 Agent 标识的自然语言消息 XML 元素。
+
+        说明:
+            控制权变更仍作为独立 RuntimeArtifact 保存，但在 Group Input 中复用已有
+            `message` 协议，避免为少量控制事件增加新的模型输入格式。
+        """
+
+        actor = escape(owner_agent_display_name or "Unknown Agent", quote=True)
+        target = escape(
+            agent_frame_change.target_display_name or agent_frame_change.target,
+            quote=True,
+        )
+        return (
+            f'<message actor="{actor}">\n'
+            f"会话控制权已变更，当前会话将由 `{target}` 继续处理。\n"
+            "</message>"
+        )
 
     def _build_history_input_llm_messages(
         self,
@@ -734,11 +822,19 @@ class ContextProjector:
     @staticmethod
     def _llm_message_to_group_input_elements(
         message: LLMMessage,
-        owner_agent_name: str,
+        owner_agent_display_name: str,
     ) -> list[str]:
-        """将原始 LLM 消息转换为 Group Input 内的来源标记。"""
+        """将原始 LLM 消息转换为 Group Input 内的来源标记。
 
-        owner = escape(owner_agent_name or "Unknown Agent", quote=True)
+        参数:
+            message: 待投影的原始 LLM 消息。
+            owner_agent_display_name: 消息所属 Agent 的对外展示名称。
+
+        返回:
+            使用展示名称标识来源的 Group Input XML 元素列表。
+        """
+
+        owner = escape(owner_agent_display_name or "Unknown Agent", quote=True)
         context_content = message.context_content
         if context_content is None:
             context_content = message.content
@@ -774,6 +870,40 @@ class ContextProjector:
         if artifact.type == RuntimeArtifactType.INTERRUPTION_REQUEST:
             request = ensure_instance(artifact.payload, InterruptionRequest, "history 中断请求产物")
             return [self._build_interruption_request_message(request)]
+
+        if artifact.type == RuntimeArtifactType.AGENT_FRAME_CHANGE:
+            agent_frame_change = ensure_instance(
+                artifact.payload,
+                AgentFrameChange,
+                "history 控制权变更产物",
+            )
+            if (
+                (
+                    agent_frame_change.type == AgentFrameChangeType.PUSH
+                    and agent_frame_change.reason == AgentFrameChangeReason.HANDOFF
+                )
+                or (
+                    agent_frame_change.type == AgentFrameChangeType.POP
+                    and agent_frame_change.reason
+                    == AgentFrameChangeReason.HANDOFF_RETURN_TOOL
+                )
+            ):
+
+                # PUSH 和 HANDOFF_RETURN_TOOL 都会中断来源 Agent 的 tool 循环，需补充
+                # assistant 消息闭合原生工具调用链。
+                return [
+                    LLMMessage(
+                        role=MessageRole.ASSISTANT,
+                        content=(
+                            "接下来将由 "
+                            f"`{agent_frame_change.target_display_name or agent_frame_change.target}` "
+                            "为您处理。"
+                        ),
+                    ),
+                ]
+
+            # 自动 POP 前已有子 Agent 最终回复，不再追加 assistant，避免形成连续 assistant。
+            return []
         if artifact.type in (RuntimeArtifactType.ASSISTANT_MESSAGE, RuntimeArtifactType.TOOL_CALL):
             return [ensure_instance(artifact.payload, LLMMessage, "history 消息产物")]
         if artifact.type == RuntimeArtifactType.TOOL_CALL_EXE:
@@ -837,11 +967,7 @@ class ContextProjector:
             execution_unit: 已完成且持有执行结果的工具或 LLM 执行单元。
 
         返回:
-            对应的原生 LLM 消息；handoff 工具结果后额外补一条空 assistant 响应。
-
-        说明:
-            handoff 后来源 Agent 不再实际执行 continuation LLM 调用，但历史中的 tool call
-            协议仍需闭合。补充的空 assistant 消息仅表示该工具链结束，不表达新的事实结论。
+            对应的原生 tool result 或 continuation assistant 消息。
         """
 
         if execution_unit.result is None:
@@ -853,23 +979,13 @@ class ContextProjector:
             if not content:
                 return []
 
-            messages = [
+            return [
                 LLMMessage(
                     role=MessageRole.TOOL,
                     content=content,
                     tool_call_id=tool_unit.tool_call.id,
                 )
             ]
-            if tool_unit.result and tool_unit.result.handoff is not None:
-
-                # handoff 立即切换控制权，复用工具结果中的展示名称闭合来源 Agent 的工具调用链。
-                messages.append(
-                    LLMMessage(
-                        role=MessageRole.ASSISTANT,
-                        content=result.tool_result.content,
-                    )
-                )
-            return messages
 
         if execution_unit.unit_type == RESERVED_UNIT_TYPE_LLM_CALL:
             result = ensure_instance(execution_unit.result, LLMCallExecutionResult, "LLM 调用执行单元结果")

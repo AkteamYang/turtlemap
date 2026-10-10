@@ -29,6 +29,7 @@ from turtlemap.kernel.models.enums import (
     AgentFrameChangeReason,
     AgentFrameChangeType,
     EventType,
+    RuntimeArtifactType,
     SessionStateSaveKind,
     TaskStateKind,
     TaskStatus,
@@ -343,6 +344,7 @@ class Runtime(BaseRuntime):
 
         return await self.os_service.generate_assistant_message_with_task(
             owner_agent=owner_agent,
+            agent_name2agent=self.agent_name2agent,
             task=task,
             no_tool_call=no_tool_call,
         )
@@ -397,98 +399,31 @@ class Runtime(BaseRuntime):
         """
 
         _ = owner_state
+        exact_owner_agent = ensure_instance(
+            owner_agent,
+            Agent,
+            "已完成任务的 Owner Agent",
+        )
         task.agent_frame_change = self._build_task_agent_frame_change(
-            owner_agent=ensure_instance(
-                owner_agent,
-                Agent,
-                "已完成任务的 Owner Agent",
-            ),
+            owner_agent=exact_owner_agent,
             task=task,
         )
+        if task.agent_frame_change is None:
+            return
 
-    def _build_task_agent_frame_change(
-        self,
-        owner_agent: Agent,
-        task: BaseProcessingTask,
-    ) -> AgentFrameChange | None:
-        """从完成任务的工具结果或最终消息构建控制权栈变更。
-
-        参数:
-            owner_agent: 已完成任务的精确 os 层 Agent。
-            task: 已完成、待关闭的任务现场。
-
-        返回:
-            handoff 时返回工具产生的 push 变更；普通 subagent 未声明继续执行时
-            返回 pop 变更；无需变更时返回 `None`。
-        """
-        # handoff 场景 push frame
-        if task.state.kind == TaskStateKind.TOOL:
-            tool_state = ensure_instance(task.state, ToolState, "已完成工具任务状态")
-            execution_unit = tool_state.execution_units[-1]
-            if not execution_unit.result:
-                return None
-
-            if execution_unit.result.handoff is not None:
-                return ensure_instance(execution_unit.result.handoff, AgentFrameChange, "工具任务的 Agent 控制权变更")
-
-        # subagent 完成任务 pop frame
-        current_agent_is_subagent = len(self.real_session_state.agent_frames) > 1
-        if not current_agent_is_subagent:
-            return None
-
-        message = self._get_completed_task_message(task)
-        if message is None or message.runtime_params.get(K_HAS_CONTINUE_TAG, False):
-            return None
-
-        current_frame = self.real_session_state.agent_frames[-1]
-        parent_frame = self.real_session_state.agent_frames[-2]
-        if current_frame.agent_name != owner_agent.agent_name:
-            raise OSRuntimeError(
-                "完成任务的 Owner Agent 与当前控制权栈顶不一致："
-                f"owner_agent={owner_agent.agent_name}, "
-                f"current_agent={current_frame.agent_name}, task_id={task.task_id}"
-            )
-        
-        return AgentFrameChange(
-            source=current_frame.agent_name,
-            target=parent_frame.agent_name,
-            type=AgentFrameChangeType.POP,
-            reason=AgentFrameChangeReason.HANDOFF_RETURN,
+        agent_frame_change = ensure_instance(
+            task.agent_frame_change,
+            AgentFrameChange,
+            "完成任务的 Agent 控制权变更",
         )
 
-    @staticmethod
-    def _get_completed_task_message(task: BaseProcessingTask) -> LLMMessage | None:
-        """读取完成任务最终可用于决定控制流的 assistant 消息。
-
-        参数:
-            task: 已完成的消息或工具循环任务。
-
-        返回:
-            MessageState 的最终消息，或 ToolState 最后一个 continuation LLM 消息；
-            任务未形成 LLM 消息时返回 `None`。
-        """
-
-        if task.state.kind == TaskStateKind.MESSAGE:
-            message_state = ensure_instance(task.state, MessageState, "已完成消息任务状态")
-            if message_state.message is None:
-                return None
-
-            return ensure_instance(message_state.message.payload, LLMMessage, "已完成消息任务产物")
-
-        if task.state.kind == TaskStateKind.TOOL:
-            tool_state = ensure_instance(task.state, ToolState, "已完成工具任务状态")
-            if not tool_state.execution_units:
-                return None
-
-            execution_unit = tool_state.execution_units[-1]
-            if execution_unit.unit_type != RESERVED_UNIT_TYPE_LLM_CALL:
-                return None
-
-            execution_unit = ensure_instance(execution_unit, LLMCallExecutionUnit, "已完成工具任务的最后一个执行单元")
-            if execution_unit.result is not None:
-                return execution_unit.real_result.message
-
-        return None
+        # 控制权变更是会话中的稳定事实，需随任务产物写入 history 供后续 Agent 感知。
+        self.real_session_state.history.append(
+            self._build_agent_frame_change_history_artifact(
+                owner_agent=exact_owner_agent,
+                agent_frame_change=agent_frame_change,
+            )
+        )
 
     @override
     async def _override_service_input_did_process(
@@ -588,6 +523,122 @@ class Runtime(BaseRuntime):
         # 保存已完成任务的 event，用于回放
         p_task = ensure_instance(task, ProcessingTask)
         self.os_service.save_finished_task_evnets(p_task)
+
+    def _build_agent_frame_change_history_artifact(
+            self,
+            owner_agent: Agent,
+            agent_frame_change: AgentFrameChange,
+        ) -> RuntimeArtifact:
+            """构建用于记录 Agent 控制权变更的稳定 history 产物。
+    
+            参数:
+                owner_agent: 触发当前控制权变更的来源 Agent。
+                agent_frame_change: 已由完成任务确定、尚待 kernel 执行的控制权变更。
+    
+            返回:
+                可写入会话 history 的控制权变更产物。
+    
+            说明:
+                push 与 pop 都显式记录为独立控制事件。该产物不伪装为 assistant 回复，
+                以免 pop 后同一子 Agent 在 Group Input 中连续出现两条自然语言消息。
+            """
+    
+            return RuntimeArtifact(
+                type=RuntimeArtifactType.AGENT_FRAME_CHANGE,
+                owner_agent_name=owner_agent.agent_name,
+                payload=agent_frame_change,
+            )
+    
+    def _build_task_agent_frame_change(
+        self,
+        owner_agent: Agent,
+        task: BaseProcessingTask,
+    ) -> AgentFrameChange | None:
+        """从完成任务的工具结果或最终消息构建控制权栈变更。
+
+        参数:
+            owner_agent: 已完成任务的精确 os 层 Agent。
+            task: 已完成、待关闭的任务现场。
+
+        返回:
+            handoff 时返回工具产生的 push 变更；普通 subagent 未声明继续执行时
+            返回 pop 变更；无需变更时返回 `None`。
+        """
+        # handoff 场景 push/pop frame
+        if task.state.kind == TaskStateKind.TOOL:
+            tool_state = ensure_instance(task.state, ToolState, "已完成工具任务状态")
+            execution_unit = tool_state.execution_units[-1]
+            if not execution_unit.result:
+                return None
+
+            if execution_unit.result.handoff is not None:
+                return ensure_instance(execution_unit.result.handoff, AgentFrameChange, "工具任务的 Agent 控制权变更")
+
+        # subagent 完成任务 pop frame
+        current_agent_is_subagent = len(self.real_session_state.agent_frames) > 1
+        if not current_agent_is_subagent:
+            return None
+
+        message = self._get_completed_task_message(task)
+        if message is None or message.runtime_params.get(K_HAS_CONTINUE_TAG, False):
+            return None
+
+        current_frame = self.real_session_state.agent_frames[-1]
+        parent_frame = self.real_session_state.agent_frames[-2]
+        if current_frame.agent_name != owner_agent.agent_name:
+            raise OSRuntimeError(
+                "完成任务的 Owner Agent 与当前控制权栈顶不一致："
+                f"owner_agent={owner_agent.agent_name}, "
+                f"current_agent={current_frame.agent_name}, task_id={task.task_id}"
+            )
+        
+        return AgentFrameChange(
+            source=current_frame.agent_name,
+            target=parent_frame.agent_name,
+            type=AgentFrameChangeType.POP,
+            reason=AgentFrameChangeReason.HANDOFF_RETURN,
+            source_display_name=owner_agent.name,
+            target_display_name=ensure_instance(
+                self.agent_name2agent.get(parent_frame.agent_name),
+                Agent,
+                "POP 控制权变更目标 Agent",
+            ).name,
+        )
+
+    @staticmethod
+    def _get_completed_task_message(task: BaseProcessingTask) -> LLMMessage | None:
+        """读取完成任务最终可用于决定控制流的 assistant 消息。
+
+        参数:
+            task: 已完成的消息或工具循环任务。
+
+        返回:
+            MessageState 的最终消息，或 ToolState 最后一个 continuation LLM 消息；
+            任务未形成 LLM 消息时返回 `None`。
+        """
+
+        if task.state.kind == TaskStateKind.MESSAGE:
+            message_state = ensure_instance(task.state, MessageState, "已完成消息任务状态")
+            if message_state.message is None:
+                return None
+
+            return ensure_instance(message_state.message.payload, LLMMessage, "已完成消息任务产物")
+
+        if task.state.kind == TaskStateKind.TOOL:
+            tool_state = ensure_instance(task.state, ToolState, "已完成工具任务状态")
+            if not tool_state.execution_units:
+                return None
+
+            execution_unit = tool_state.execution_units[-1]
+            if execution_unit.unit_type != RESERVED_UNIT_TYPE_LLM_CALL:
+                return None
+
+            execution_unit = ensure_instance(execution_unit, LLMCallExecutionUnit, "已完成工具任务的最后一个执行单元")
+            if execution_unit.result is not None:
+                return execution_unit.real_result.message
+
+        return None
+
 
     def _write_buffer(self, event: RuntimeEvent) -> None:
         """将已发送事件写入所属任务的可恢复 buffer。
